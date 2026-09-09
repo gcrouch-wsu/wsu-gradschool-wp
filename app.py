@@ -365,24 +365,24 @@ def create_app() -> Flask:
         rows = filtered_rows(state["report"])
         decisions = state["decisions"]
         if format_name == "json":
-            payload = []
-            for row in rows:
-                exported_row = dict(row)
-                exported_row["review_decision"] = decisions.get(row["id"], "unreviewed")
-                payload.append(exported_row)
+            def generate_json():
+                yield "[\n"
+                for index, row in enumerate(rows):
+                    exported_row = dict(row)
+                    exported_row["review_decision"] = decisions.get(row["id"], "unreviewed")
+                    if index:
+                        yield ",\n"
+                    yield json.dumps(exported_row, ensure_ascii=False, separators=(",", ":"))
+                yield "\n]\n"
+
             return Response(
-                json.dumps(payload, ensure_ascii=False, indent=2),
+                generate_json(),
                 mimetype="application/json",
                 headers={"Content-Disposition": "attachment; filename=wordpress-content-audit.json"},
             )
         if format_name != "csv":
             return jsonify({"error": "Unsupported export format."}), 404
 
-        payload = []
-        for row in rows:
-            exported_row = dict(row)
-            exported_row["review_decision"] = decisions.get(row["id"], "unreviewed")
-            payload.append(exported_row)
         fields = (
             "id", "group_label", "type", "content_class", "title", "url", "file_name",
             "mime_type", "file_extension", "file_size", "width", "height", "stored_path",
@@ -393,13 +393,21 @@ def create_app() -> Flask:
             "inbound_strong", "inbound_possible", "inbound_structural", "outbound",
             "review_decision",
         )
-        output = io.StringIO(newline="")
-        writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader()
-        for row in payload:
-            writer.writerow({field: _spreadsheet_safe(row.get(field)) for field in fields})
+        def generate_csv():
+            output = io.StringIO(newline="")
+            writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            yield "\ufeff" + output.getvalue()
+            for row in rows:
+                output.seek(0)
+                output.truncate(0)
+                exported_row = dict(row)
+                exported_row["review_decision"] = decisions.get(row["id"], "unreviewed")
+                writer.writerow({field: _spreadsheet_safe(exported_row.get(field)) for field in fields})
+                yield output.getvalue()
+
         return Response(
-            "\ufeff" + output.getvalue(),
+            generate_csv(),
             mimetype="text/csv",
             headers={"Content-Disposition": "attachment; filename=wordpress-content-audit.csv"},
         )
