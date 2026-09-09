@@ -66,6 +66,37 @@ def test_chunked_upload_survives_separate_requests_and_can_be_removed():
     assert client.get("/api/items").status_code == 404
 
 
+def test_new_upload_session_deletes_previous_pending_chunks():
+    app = create_app()
+    app.config.update(TESTING=True)
+    client = app.test_client()
+    store = app.extensions["audit_store"]
+    first = client.post(
+        "/api/upload-session",
+        json={"filename": "test.xml", "size": len(WXR), "total_chunks": 1},
+    )
+    first_id = first.get_json()["upload_id"]
+    client.post(
+        "/api/upload-chunk/0", data=WXR,
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert store.get_chunk(first_id, 0) == WXR
+    client.post(
+        "/api/upload-session",
+        json={"filename": "again.xml", "size": len(WXR), "total_chunks": 1},
+    )
+    assert store.get_chunk(first_id, 0) is None
+
+
+def test_stale_upload_chunks_expire():
+    from audit_store import AuditStore
+
+    store = AuditStore()
+    store.put_chunk("abandoned", 0, b"stale")
+    store._chunk_times[("abandoned", 0)] = 0
+    assert store.get_chunk("abandoned", 0) is None
+
+
 def test_live_check_is_disabled_during_tests_by_default():
     client = _client_with_report()
     response = client.post("/api/live-check", json={"group": "pages"})

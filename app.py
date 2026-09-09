@@ -171,7 +171,9 @@ def create_app() -> Flask:
                 continue
             if taxonomy and taxonomy not in row["taxonomy_terms"]:
                 continue
-            if term and term not in row["taxonomy_terms"].get(taxonomy, []):
+            assigned = row["taxonomy_terms"].get(taxonomy, [])
+            slugs = row.get("taxonomy_slugs", {}).get(taxonomy, [])
+            if term and term not in assigned and term not in slugs:
                 continue
             if decision and row_decision != decision:
                 continue
@@ -184,6 +186,7 @@ def create_app() -> Flask:
                         row["id"], row["title"], row["slug"], row["url"],
                         row["file_name"], row["author_name"], row["author_login"],
                         row["mime_type"], row["categories"], row["tags"], row["taxonomies"],
+                        row.get("taxonomy_slugs"),
                     )
                 ).casefold()
                 if query not in searchable:
@@ -208,7 +211,7 @@ def create_app() -> Flask:
             "id", "group", "group_label", "type", "content_class", "title", "url",
             "wp_admin_url", "file_name", "file_size", "width", "height", "mime_type", "file_extension",
             "author_name", "author_login", "status", "created", "modified", "categories",
-            "tags", "taxonomy_terms", "classification", "underlying_classification",
+            "tags", "taxonomy_terms", "taxonomy_slugs", "classification", "underlying_classification",
             "confidence", "inbound_strong", "inbound_possible", "inbound_structural",
             "outbound", "expected_development", "derivative_count",
         )
@@ -288,8 +291,11 @@ def create_app() -> Flask:
             ), 400
 
         try:
+            previous_id = session.get("audit_id")
             audit_id = uuid4().hex
             report = analyze_and_store(uploaded.stream, uploaded.filename, audit_id)
+            if previous_id and previous_id != audit_id:
+                audit_store.delete_audit(previous_id)
             return render_template(
                 "index.html",
                 **template_kwargs(report=report, error=None, filename=uploaded.filename),
@@ -320,6 +326,12 @@ def create_app() -> Flask:
             return jsonify({"error": "The export must be between 1 byte and 250 MB."}), 400
         if total_chunks != expected_chunks or total_chunks > MAX_UPLOAD_CHUNKS:
             return jsonify({"error": "Invalid upload chunk count."}), 400
+        previous_pending = session.get("pending_upload") or {}
+        if previous_pending.get("id"):
+            try:
+                audit_store.delete_chunks(previous_pending["id"], previous_pending.get("total_chunks", 0))
+            except Exception:
+                app.logger.exception("Abandoned upload chunks could not be removed")
         upload_id = uuid4().hex
         session["pending_upload"] = {
             "id": upload_id, "filename": filename, "size": size,

@@ -80,6 +80,17 @@
         </div>
 
         {% if error %}<div class="alert alert-error" role="alert"><strong>Analysis stopped</strong><span>{{ error }}</span></div>{% endif %}
+        {% if report['warnings'] %}
+          <div class="alert alert-warning" role="status">
+            <strong>Analysis limits</strong>
+            <span>{{ report['warnings']|length }} warning{{ 's' if report['warnings']|length != 1 else '' }} qualify these findings.{% if report['stats']['unresolved_internal_urls'] %} {{ report['stats']['unresolved_internal_urls'] }} unresolved internal URL{{ 's' if report['stats']['unresolved_internal_urls'] != 1 else '' }} were also recorded.{% endif %}</span>
+            <ul class="warning-list">
+              {% for warning in report['warnings'][:8] %}
+                <li>{{ warning }}</li>
+              {% endfor %}
+            </ul>
+          </div>
+        {% endif %}
 
         <section class="group-section" aria-labelledby="groups-heading">
           <div class="section-heading">

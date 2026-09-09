@@ -3,9 +3,12 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import time
 from collections import OrderedDict
 from threading import RLock
 from typing import Any
+
+CHUNK_TTL_SECONDS = 60 * 60
 
 
 class AuditStore:
@@ -14,6 +17,7 @@ class AuditStore:
     def __init__(self) -> None:
         self.blob_enabled = bool(os.environ.get("BLOB_READ_WRITE_TOKEN"))
         self._chunks: dict[tuple[str, int], bytes] = {}
+        self._chunk_times: dict[tuple[str, int], float] = {}
         self._reports: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._decisions: dict[str, dict[str, str]] = {}
         self._live: dict[str, dict[str, dict]] = {}
@@ -52,7 +56,18 @@ class AuditStore:
             while len(self._reports) > 4:
                 self._reports.popitem(last=False)
 
+    def expire_stale_chunks(self) -> None:
+        """Drop in-memory chunks that were never completed."""
+        cutoff = time.time() - CHUNK_TTL_SECONDS
+        with self._lock:
+            stale_ids = {audit_id for (audit_id, _index), stamped in self._chunk_times.items() if stamped < cutoff}
+            stale_keys = [key for key in self._chunks if key[0] in stale_ids]
+            for key in stale_keys:
+                self._chunks.pop(key, None)
+                self._chunk_times.pop(key, None)
+
     def put_chunk(self, audit_id: str, index: int, payload: bytes) -> None:
+        self.expire_stale_chunks()
         if self.blob_enabled:
             with self._client() as client:
                 client.put(
@@ -61,9 +76,13 @@ class AuditStore:
                 )
             return
         with self._lock:
-            self._chunks[(audit_id, index)] = payload
+            key = (audit_id, index)
+            self._chunks[key] = payload
+            self._chunk_times[key] = time.time()
 
     def get_chunk(self, audit_id: str, index: int) -> bytes | None:
+        if not self.blob_enabled:
+            self.expire_stale_chunks()
         if self.blob_enabled:
             from vercel.blob.errors import BlobNotFoundError
             try:
@@ -84,7 +103,9 @@ class AuditStore:
             return
         with self._lock:
             for index in range(total_chunks):
-                self._chunks.pop((audit_id, index), None)
+                key = (audit_id, index)
+                self._chunks.pop(key, None)
+                self._chunk_times.pop(key, None)
 
     def save_report(self, audit_id: str, report: dict, filename: str) -> None:
         state = {"report": report, "filename": filename}
@@ -197,3 +218,4 @@ class AuditStore:
             self._live.pop(audit_id, None)
             for key in [key for key in self._chunks if key[0] == audit_id]:
                 self._chunks.pop(key, None)
+                self._chunk_times.pop(key, None)

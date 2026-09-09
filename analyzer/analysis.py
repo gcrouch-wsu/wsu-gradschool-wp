@@ -7,6 +7,7 @@ from html.parser import HTMLParser
 from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
+from .ids import wordpress_id
 from .models import ContentItem, Reference, WXRExport
 from .url_normalizer import media_variant_keys, normalize_url, public_href, url_keys
 from .wp_rest import wp_admin_edit_url
@@ -21,7 +22,16 @@ BLOCK_RE = re.compile(
 )
 BLOCK_ID_RE = re.compile(r'\"id\"\s*:\s*(\d+)', re.IGNORECASE)
 BLOCK_IDS_RE = re.compile(r'\"ids\"\s*:\s*\[([^\]]*)\]', re.IGNORECASE)
+REUSABLE_BLOCK_RE = re.compile(
+    r"<!--\s*wp:(?:block|core/block)\s+({.*?})\s*/?-->",
+    re.IGNORECASE | re.DOTALL,
+)
+BLOCK_REF_RE = re.compile(r'\"ref\"\s*:\s*(\d+)', re.IGNORECASE)
+TABLEPRESS_RE = re.compile(r"\[table(?:press)?[^\]]*\bid\s*=\s*[\"']?(\d+)", re.IGNORECASE)
+GRAVITY_FORM_RE = re.compile(r"\[gravityform(?:s)?[^\]]*\bid\s*=\s*[\"']?(\d+)", re.IGNORECASE)
+DOCUMENT_SHORTCODE_RE = re.compile(r"\[(?:document|wsu_document)[^\]]*\bid\s*=\s*[\"']?(\d+)", re.IGNORECASE)
 NUMBER_RE = re.compile(r"\d+")
+MAX_BODY_SCAN = 1_000_000
 
 STRUCTURAL_POST_TYPES = {
     "nav_menu_item",
@@ -286,8 +296,11 @@ def analyze_export(
         return targets
 
     # Navigation items are trusted entry points.
+    public_statuses = {"publish", "inherit"}
     menu_items = [item for item in export.items if item.post_type == "nav_menu_item"]
     for menu in menu_items:
+        if menu.status and menu.status not in public_statuses:
+            continue
         object_ids = menu.meta.get("_menu_item_object_id", [])
         custom_urls = menu.meta.get("_menu_item_url", [])
         for object_id in object_ids:
@@ -328,6 +341,9 @@ def analyze_export(
         for field_name, body in (("content", item.content), ("excerpt", item.excerpt)):
             if not body:
                 continue
+            if len(body) > MAX_BODY_SCAN:
+                export.warnings.append(f"Only the first {MAX_BODY_SCAN:,} characters of item {item.id} {field_name} were scanned.")
+                body = body[:MAX_BODY_SCAN]
             parser = _ReferenceHTMLParser()
             try:
                 parser.feed(body)
@@ -352,6 +368,21 @@ def analyze_export(
                 for id_list in BLOCK_IDS_RE.findall(block_json):
                     for target_id in NUMBER_RE.findall(id_list):
                         add_reference(item.id, target_id, "block-media", field_name, "strong", block.group(0))
+            for block in REUSABLE_BLOCK_RE.finditer(body):
+                for target_id in BLOCK_REF_RE.findall(block.group(1)):
+                    add_reference(item.id, target_id, "reusable-block", field_name, "strong", block.group(0))
+            for match in TABLEPRESS_RE.finditer(body):
+                target_id = wordpress_id(match.group(1))
+                if target_id:
+                    add_reference(item.id, target_id, "tablepress", field_name, "strong", match.group(0))
+            for match in GRAVITY_FORM_RE.finditer(body):
+                target_id = wordpress_id(match.group(1))
+                if target_id:
+                    add_reference(item.id, target_id, "gravityform", field_name, "possible", match.group(0))
+            for match in DOCUMENT_SHORTCODE_RE.finditer(body):
+                target_id = wordpress_id(match.group(1))
+                if target_id:
+                    add_reference(item.id, target_id, "document-shortcode", field_name, "strong", match.group(0))
 
         # Unknown custom fields are useful evidence, but less trustworthy than rendered content.
         for meta_key, values in item.meta.items():
@@ -375,6 +406,9 @@ def analyze_export(
     queue = deque(roots)
     while queue:
         source_id = queue.popleft()
+        source = reportable.get(source_id)
+        if source and source.status not in public_statuses:
+            continue
         for reference in outgoing.get(source_id, []):
             if reference.strength != "strong" or reference.target_id in reachable:
                 continue
@@ -384,7 +418,6 @@ def analyze_export(
     rows: list[dict] = []
     classification_counts: Counter[str] = Counter()
     type_counts: Counter[str] = Counter()
-    public_statuses = {"publish", "inherit"}
 
     for item in reportable.values():
         item_class = _content_class(item)
@@ -400,10 +433,16 @@ def analyze_export(
         tags = sorted({term.name for term in item.terms if term.taxonomy in {"post_tag", "tag"}})
         taxonomies = sorted({f"{term.taxonomy}: {term.name}" for term in item.terms})
         taxonomy_terms: dict[str, list[str]] = defaultdict(list)
+        taxonomy_slugs: dict[str, list[str]] = defaultdict(list)
         for term in item.terms:
             taxonomy_terms[term.taxonomy].append(term.name)
+            if term.slug:
+                taxonomy_slugs[term.taxonomy].append(term.slug)
         taxonomy_terms = {
             key: sorted(set(values)) for key, values in sorted(taxonomy_terms.items())
+        }
+        taxonomy_slugs = {
+            key: sorted(set(values)) for key, values in sorted(taxonomy_slugs.items())
         }
         reasons: list[str] = []
 
@@ -414,9 +453,13 @@ def analyze_export(
             reasons.append(f"The exported status is {item.status or 'unknown'}.")
         elif item.id in reachable:
             base_classification = "linked"
-            confidence = "high"
+            archive_only = bool(strong_inbound) and all(reference.kind == "archive" for reference in strong_inbound)
+            confidence = "medium" if archive_only else "high"
             recommendation = "Keep unless content review indicates otherwise."
-            reasons.append("Reachable from an exported menu, the site home URL, a public content archive, or linked reachable content.")
+            if archive_only:
+                reasons.append("Assumed reachable from a public content archive. The export cannot prove that archive is enabled or lists this record.")
+            else:
+                reasons.append("Reachable from an exported menu, the site home URL, a public content archive, or linked reachable content.")
         elif is_media and strong_inbound:
             base_classification = "linked"
             confidence = "high"
@@ -519,6 +562,7 @@ def analyze_export(
             "tags": tags,
             "taxonomies": taxonomies,
             "taxonomy_terms": taxonomy_terms,
+            "taxonomy_slugs": taxonomy_slugs,
             "meta_keys": sorted(item.meta),
             "classification": classification,
             "underlying_classification": base_classification,
@@ -585,10 +629,12 @@ def analyze_export(
 
         taxonomy_term_counts: dict[str, Counter[str]] = defaultdict(Counter)
         taxonomy_record_counts: Counter[str] = Counter()
+        taxonomy_unique_keys: dict[str, set[str]] = defaultdict(set)
         for row in members:
             for taxonomy, terms in row["taxonomy_terms"].items():
                 taxonomy_record_counts[taxonomy] += 1
                 taxonomy_term_counts[taxonomy].update(terms)
+                taxonomy_unique_keys[taxonomy].update(row.get("taxonomy_slugs", {}).get(taxonomy) or terms)
 
         taxonomies = []
         for taxonomy, term_counts in sorted(
@@ -599,7 +645,7 @@ def analyze_export(
                 {
                     "key": taxonomy,
                     "label": TAXONOMY_LABELS.get(taxonomy, taxonomy.replace("_", " ").title()),
-                    "unique_terms": len(term_counts),
+                    "unique_terms": len(taxonomy_unique_keys[taxonomy]),
                     "assignments": sum(term_counts.values()),
                     "records_tagged": taxonomy_record_counts[taxonomy],
                     "terms": [
@@ -625,10 +671,12 @@ def analyze_export(
             "finding_counts": dict(sorted(finding_counts.items())),
             "subtype_counts": dict(sorted(subtype_counts.items())),
             "taxonomy_count": len(taxonomies),
-            "incomplete": group_id == "forms",
+            "incomplete": group_id in {"forms", "tablepress"},
             "note": (
                 "The WXR contains form-associated posts and IDs, but not Gravity Forms definitions or field settings."
                 if group_id == "forms"
+                else "Table shortcodes are extracted when present, but plugin settings and unregistered table IDs may still be missing."
+                if group_id == "tablepress"
                 else ""
             ),
         }
@@ -640,7 +688,7 @@ def analyze_export(
         groups.append(group)
 
     source_coverage = [
-        {"source": "WXR content and excerpts", "available": True, "detail": "Links, embeds, selected media blocks, galleries, and URL-shaped text"},
+        {"source": "WXR content and excerpts", "available": True, "detail": "Links, embeds, selected media blocks, galleries, TablePress/document shortcodes, and reusable-block refs"},
         {"source": "Navigation menus", "available": bool(menu_items), "detail": f"{len(menu_items)} exported menu records"},
         {"source": "Post custom fields", "available": True, "detail": "URL evidence and selected relationship IDs such as featured images"},
         {"source": "Attachment metadata", "available": True, "detail": "Paths, dimensions, ALT text, and generated variants when exported"},

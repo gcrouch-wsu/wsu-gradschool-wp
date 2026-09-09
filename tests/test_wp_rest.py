@@ -11,6 +11,44 @@ def test_wp_admin_edit_url():
     )
 
 
+def test_list_type_follows_total_pages_header():
+    seen = []
+
+    def fake_get(url, headers, timeout):
+        seen.append(url)
+        if "&page=2" in url or url.endswith("page=2"):
+            return 200, [{"id": 2, "status": "publish", "type": "page"}], {"x-wp-totalpages": "2"}
+        return 200, [{"id": 1, "status": "publish", "type": "page"}], {"x-wp-totalpages": "2"}
+
+    client = WordPressRestClient("https://example.test", "gcrouch", "secret", http_get=fake_get)
+    status, payload = client.list_type("pages", ["1", "2"])
+    assert status == 200
+    assert {record["id"] for record in payload} == {1, 2}
+    assert any("&page=2" in url or url.endswith("page=2") for url in seen)
+
+
+def test_list_type_rejects_non_list_payload():
+    def fake_get(url, headers, timeout):
+        return 200, {"message": "not a list"}
+
+    client = WordPressRestClient("https://example.test", "gcrouch", "secret", http_get=fake_get)
+    status, payload = client.list_type("pages", ["1"])
+    assert status == 502
+    results = live_check_items([{"id": "1", "type": "page"}], client)
+    assert results["1"]["live_state"] == "error"
+    assert "unexpected" in results["1"]["error"]
+
+
+def test_list_type_errors_when_pagination_exceeds_limit():
+    def fake_get(url, headers, timeout):
+        return 200, [{"id": 1, "status": "publish", "type": "page"}], {"x-wp-totalpages": "21"}
+
+    client = WordPressRestClient("https://example.test", "gcrouch", "secret", http_get=fake_get)
+    status, payload = client.list_type("pages", ["1"])
+    assert status == 502
+    assert "pagination" in payload["message"]
+
+
 def test_list_type_sends_csv_include_list():
     seen = []
 

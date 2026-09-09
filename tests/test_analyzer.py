@@ -120,7 +120,94 @@ def test_published_events_are_reachable_from_the_calendar_archive():
     _, rows = _rows_by_id()
     assert rows["20"]["group"] == "events"
     assert rows["20"]["classification"] == "linked"
+    assert rows["20"]["confidence"] == "medium"
     assert rows["20"]["evidence"][0]["kind"] == "archive"
+
+
+def test_tablepress_shortcode_links_the_table_record():
+    wxr = WXR.replace(
+        b"<a href=\"/child/\">Child</a>",
+        b"<a href=\"/child/\">Child</a>[table id=99]",
+    ).replace(
+        b"</channel></rss>",
+        b"""  <item>
+    <title>Program table</title><link>https://example.test/table/99</link>
+    <dc:creator>editor</dc:creator><content:encoded></content:encoded><excerpt:encoded></excerpt:encoded>
+    <wp:post_id>99</wp:post_id><wp:post_date>2026-01-01 00:00:00</wp:post_date>
+    <wp:post_modified>2026-01-02 00:00:00</wp:post_modified><wp:status>publish</wp:status>
+    <wp:post_type>tablepress_table</wp:post_type><wp:post_parent>0</wp:post_parent>
+  </item>
+</channel></rss>""",
+    )
+    report = analyze_export(parse_wxr(BytesIO(wxr)))
+    rows = {row["id"]: row for row in report["items"]}
+    assert rows["99"]["group"] == "tablepress"
+    assert rows["99"]["classification"] == "linked"
+    assert any(entry["kind"] == "tablepress" for entry in rows["99"]["evidence"])
+    groups = {group["id"]: group for group in report["groups"]}
+    assert groups["tablepress"]["incomplete"] is True
+
+
+def test_report_surfaces_warnings_and_taxonomy_slugs():
+    wxr = WXR.replace(
+        b"<wp:post_parent>0</wp:post_parent>\n  </item>\n  <item>\n    <title>Child page</title>",
+        b"""<wp:post_parent>0</wp:post_parent>
+    <category domain="category" nicename="news"><![CDATA[News]]></category>
+  </item>
+  <item>
+    <title>Child page</title>""",
+    )
+    report = analyze_export(parse_wxr(BytesIO(wxr)))
+    rows = {row["id"]: row for row in report["items"]}
+    assert rows["1"]["taxonomy_slugs"]["category"] == ["news"]
+    assert rows["1"]["taxonomy_terms"]["category"] == ["News"]
+    assert any("cannot see hard-coded theme links" in warning for warning in report["warnings"])
+    pages = next(group for group in report["groups"] if group["id"] == "pages")
+    catalog = next(taxonomy for taxonomy in report["taxonomies_by_group"]["pages"] if taxonomy["key"] == "category")
+    assert catalog["unique_terms"] == 1
+    assert catalog["terms"][0]["name"] == "News"
+    assert pages["taxonomy_count"] == 1
+
+
+def test_shortcodes_and_reusable_blocks_create_references():
+    wxr = WXR.replace(
+        b"<a href=\"/child/\">Child</a>",
+        b"""<a href="/child/">Child</a><!-- wp:block {"ref":55} /-->[gravityform id=7][document id=8]""",
+    ).replace(
+        b"</channel></rss>",
+        b"""  <item>
+    <title>Shared block</title><link>https://example.test/block/55</link>
+    <dc:creator>editor</dc:creator><content:encoded></content:encoded><excerpt:encoded></excerpt:encoded>
+    <wp:post_id>55</wp:post_id><wp:post_date>2026-01-01 00:00:00</wp:post_date>
+    <wp:post_modified>2026-01-02 00:00:00</wp:post_modified><wp:status>publish</wp:status>
+    <wp:post_type>wp_block</wp:post_type><wp:post_parent>0</wp:post_parent>
+  </item>
+  <item>
+    <title>Policy PDF</title><link>https://example.test/document/8</link>
+    <dc:creator>editor</dc:creator><content:encoded></content:encoded><excerpt:encoded></excerpt:encoded>
+    <wp:post_id>8</wp:post_id><wp:post_date>2026-01-01 00:00:00</wp:post_date>
+    <wp:post_modified>2026-01-02 00:00:00</wp:post_modified><wp:status>publish</wp:status>
+    <wp:post_type>document</wp:post_type><wp:post_parent>0</wp:post_parent>
+  </item>
+  <item>
+    <title>Contact form</title><link>https://example.test/form/7</link>
+    <dc:creator>editor</dc:creator><content:encoded></content:encoded><excerpt:encoded></excerpt:encoded>
+    <wp:post_id>7</wp:post_id><wp:post_date>2026-01-01 00:00:00</wp:post_date>
+    <wp:post_modified>2026-01-02 00:00:00</wp:post_modified><wp:status>publish</wp:status>
+    <wp:post_type>wsuwp_form</wp:post_type><wp:post_parent>0</wp:post_parent>
+    <wp:postmeta><wp:meta_key>_gform-form-id</wp:meta_key><wp:meta_value>7</wp:meta_value></wp:postmeta>
+  </item>
+</channel></rss>""",
+    )
+    report = analyze_export(parse_wxr(BytesIO(wxr)))
+    rows = {row["id"]: row for row in report["items"]}
+    assert rows["55"]["classification"] == "linked"
+    assert any(entry["kind"] == "reusable-block" for entry in rows["55"]["evidence"])
+    assert rows["8"]["group"] == "documents"
+    assert rows["8"]["classification"] == "linked"
+    assert any(entry["kind"] == "document-shortcode" for entry in rows["8"]["evidence"])
+    assert rows["7"]["group"] == "forms"
+    assert any(entry["kind"] == "gravityform" for entry in rows["7"]["evidence"])
 
 
 def test_parser_skips_non_canonical_wordpress_ids():

@@ -52,6 +52,8 @@ h3 { font-size: 1.1rem; }
 .button-detail { background: white; border-color: #c8cdd0; color: var(--ink); font-size: .78rem; padding: 7px 10px; }
 .alert { border-radius: 7px; margin: 18px 0; padding: 13px 16px; }
 .alert-error { background: #fff0f2; border: 1px solid #e8b7c1; color: #770b21; display: grid; }
+.alert-warning { background: #fff8e8; border: 1px solid #ead9a8; color: #65480f; display: grid; gap: 6px; }
+.warning-list { margin: 8px 0 0; padding-left: 18px; }
 .report-shell { padding-block: 45px 70px; }
 .report-titlebar { align-items: end; display: flex; justify-content: space-between; gap: 30px; margin-bottom: 40px; }
 .report-titlebar h1 { font-size: clamp(2rem, 3.4vw, 3.35rem); margin-bottom: 10px; }

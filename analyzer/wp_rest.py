@@ -88,23 +88,31 @@ def _http_request(
     try:
         with urlopen(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8")
-            return response.status, _read_json_response(raw, str(response.status))
+            headers = {key.lower(): str(value) for key, value in response.headers.items()}
+            return response.status, _read_json_response(raw, str(response.status)), headers
     except HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
         parsed = _read_json_response(raw, str(exc.reason))
         if not parsed:
             parsed = {"message": str(exc.reason)}
-        return exc.code, parsed
+        return exc.code, parsed, {}
     except URLError as exc:
-        return 0, {"message": str(exc.reason or exc)}
+        return 0, {"message": str(exc.reason or exc)}, {}
 
 
-def _http_get(url: str, headers: dict[str, str], timeout: int) -> tuple[int, Any]:
-    return _http_request(url, headers, timeout, "GET")
+def _unwrap_http(result) -> tuple[int, Any, dict[str, str]]:
+    if isinstance(result, tuple) and len(result) == 3:
+        return result[0], result[1], result[2] or {}
+    status, payload = result
+    return status, payload, {}
 
 
-def _http_delete(url: str, headers: dict[str, str], timeout: int) -> tuple[int, Any]:
-    return _http_request(url, headers, timeout, "DELETE")
+def _http_get(url: str, headers: dict[str, str], timeout: int) -> tuple[int, Any, dict[str, str]]:
+    return _unwrap_http(_http_request(url, headers, timeout, "GET"))
+
+
+def _http_delete(url: str, headers: dict[str, str], timeout: int) -> tuple[int, Any, dict[str, str]]:
+    return _unwrap_http(_http_request(url, headers, timeout, "DELETE"))
 
 
 class WordPressRestClient:
@@ -147,15 +155,40 @@ class WordPressRestClient:
             "context": "edit",
             "_fields": "id,status,link,modified,type",
         }
-        url = f"{self.base_url}/wp-json/wp/v2/{safe_base}?{urlencode(query)}"
-        return self.http_get(url, self.headers, self.timeout)
+        collected: list[Any] = []
+        page = 1
+        while page <= 20:
+            query["page"] = str(page)
+            url = f"{self.base_url}/wp-json/wp/v2/{safe_base}?{urlencode(query)}"
+            status, payload, headers = _unwrap_http(self.http_get(url, self.headers, self.timeout))
+            if status != 200:
+                return status, payload
+            if not isinstance(payload, list):
+                return 502, {"message": "WordPress REST returned an unexpected list payload."}
+            collected.extend(payload)
+            try:
+                total_pages = int(headers.get("x-wp-totalpages") or 0)
+            except ValueError:
+                total_pages = 0
+            if total_pages:
+                if page >= total_pages:
+                    break
+            elif not payload or len(payload) < int(query["per_page"]):
+                break
+            elif len(collected) >= len(safe_ids):
+                break
+            page += 1
+        else:
+            return 502, {"message": "WordPress REST listing exceeded the pagination limit."}
+        return 200, collected
 
     def get_item(self, rest_base: str, item_id: str) -> tuple[int, Any]:
         url = _resource_url(self.base_url, rest_base, item_id)
         if not url:
             return 400, {"message": "WordPress ID or REST route is invalid."}
         query = urlencode({"context": "edit", "_fields": "id,status,type,title,link,modified"})
-        return self.http_get(f"{url}?{query}", self.headers, self.timeout)
+        status, payload, _headers = _unwrap_http(self.http_get(f"{url}?{query}", self.headers, self.timeout))
+        return status, payload
 
     def trash(self, rest_base: str, item_id: str) -> tuple[int, Any]:
         # WordPress Trash is DELETE without force. POST status=trash is rejected
@@ -163,7 +196,8 @@ class WordPressRestClient:
         url = _resource_url(self.base_url, rest_base, item_id)
         if not url:
             return 400, {"message": "WordPress ID or REST route is invalid."}
-        return self.http_delete(url, self.headers, self.timeout)
+        status, payload, _headers = _unwrap_http(self.http_delete(url, self.headers, self.timeout))
+        return status, payload
 
 
 def client_from_env(
@@ -226,7 +260,11 @@ def live_check_items(
                 for item_id in chunk:
                     results[item_id] = _empty_live(item_id, rest_base, "error", str(message))
                 continue
-            records = payload if isinstance(payload, list) else []
+            if not isinstance(payload, list):
+                for item_id in chunk:
+                    results[item_id] = _empty_live(item_id, rest_base, "error", "WordPress REST returned an unexpected payload.")
+                continue
+            records = payload
             for record in records:
                 found[str(record.get("id"))] = record
         if unsupported:

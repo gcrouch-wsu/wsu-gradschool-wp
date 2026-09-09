@@ -237,4 +237,4 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=5000, debug=True)
+    raise SystemExit("legacy_wp.py is retired and is not a supported entry point. Use python app.py.")
