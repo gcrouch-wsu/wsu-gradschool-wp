@@ -42,6 +42,11 @@ def normalize_url(value: str, base_url: str = "") -> str:
     return urlunsplit((scheme, host, path, parsed.query, ""))
 
 
+def public_href(value: str) -> str:
+    """Return an http(s) URL safe for server-rendered hyperlinks."""
+    return normalize_url(value)
+
+
 def url_keys(value: str, base_url: str = "") -> set[str]:
     """Produce host-aware and path-aware keys for resolving migrated WordPress URLs."""
     normalized = normalize_url(value, base_url)

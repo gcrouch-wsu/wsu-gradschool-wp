@@ -7,6 +7,7 @@ import os
 import secrets
 from io import BytesIO
 from time import perf_counter
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from defusedxml.common import DefusedXmlException
@@ -14,6 +15,7 @@ from flask import Flask, Response, jsonify, render_template, request, session
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from analyzer import analyze_export, parse_wxr
+from analyzer.ids import LOOPBACK_HOSTS, sites_are_same, wordpress_id
 from analyzer.wp_rest import MAX_TRASH_BATCH, client_from_env, live_check_items, rest_base_for, trash_items
 from audit_store import AuditStore
 from local_env import load_local_env, rest_enabled, rest_write_enabled
@@ -63,11 +65,9 @@ def create_app() -> Flask:
     load_local_env()
     app = Flask(__name__, static_folder="public", static_url_path="")
     app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
-    app.secret_key = (
-        os.environ.get("FLASK_SECRET_KEY")
-        or os.environ.get("BLOB_READ_WRITE_TOKEN")
-        or secrets.token_hex(32)
-    )
+    if os.environ.get("VERCEL") and not os.environ.get("FLASK_SECRET_KEY"):
+        raise RuntimeError("FLASK_SECRET_KEY is required on Vercel.")
+    app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
     app.config.update(
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Strict",
@@ -82,7 +82,27 @@ def create_app() -> Flask:
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "same-origin"
         response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; img-src 'self' https: data:; style-src 'self'; "
+            "script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; "
+            "form-action 'self'; frame-ancestors 'none'"
+        )
         return response
+
+    def write_request_allowed() -> bool:
+        if app.config.get("TESTING"):
+            return True
+        host = (request.host or "").split(":")[0].casefold()
+        if host not in LOOPBACK_HOSTS:
+            return False
+        origin = request.headers.get("Origin") or request.headers.get("Referer") or ""
+        if not origin:
+            return True
+        try:
+            origin_host = (urlsplit(origin).hostname or "").casefold()
+        except ValueError:
+            return False
+        return not origin_host or origin_host in LOOPBACK_HOSTS
 
     def rest_available() -> bool:
         return rest_enabled(testing=bool(app.config.get("TESTING")))
@@ -476,6 +496,8 @@ def create_app() -> Flask:
     def api_trash():
         if not write_available():
             return jsonify({"error": "Local WordPress Trash is not enabled. Set WP_REST_WRITE_ENABLED=1 in .env.local."}), 403
+        if not write_request_allowed():
+            return jsonify({"error": "WordPress Trash is only available from this machine."}), 403
         state = latest_state()
         if not state:
             return jsonify({"error": "No export has been analyzed."}), 404
@@ -485,7 +507,12 @@ def create_app() -> Flask:
         raw_ids = data.get("ids") or []
         if not isinstance(raw_ids, list):
             return jsonify({"error": "Choose one or more records to move to Trash."}), 400
-        ids = [str(item_id).strip() for item_id in raw_ids if str(item_id).strip()]
+        ids = []
+        for raw_id in raw_ids:
+            safe_id = wordpress_id(raw_id)
+            if not safe_id:
+                return jsonify({"error": "Each record ID must be a positive WordPress ID."}), 400
+            ids.append(safe_id)
         if not ids:
             return jsonify({"error": "Choose one or more records to move to Trash."}), 400
         if len(ids) > MAX_TRASH_BATCH:
@@ -504,9 +531,12 @@ def create_app() -> Flask:
         if unsupported:
             return jsonify({"error": f"Record {unsupported[0]} cannot be trashed through WordPress REST."}), 400
         items = [by_id[item_id] for item_id in ids]
+        site = state["report"].get("site") or {}
+        site_url = site.get("site_url") or site.get("home_url") or ""
+        rest_url = os.environ.get("WP_REST_BASE_URL", "")
+        if not sites_are_same([site.get("site_url") or "", site.get("home_url") or ""], rest_url):
+            return jsonify({"error": "This export is not from the WordPress site configured for local REST writes."}), 409
         try:
-            site = state["report"].get("site") or {}
-            site_url = site.get("site_url") or site.get("home_url") or ""
             results = trash_items(items, client_from_env(), site_url=site_url)
         except PermissionError as exc:
             return jsonify({"error": str(exc)}), 403

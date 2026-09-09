@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from analyzer.ids import rest_base_url_allowed
+
 
 ROOT = Path(__file__).resolve().parent
 
@@ -28,7 +30,7 @@ def load_local_env() -> None:
 
 def rest_credentials_configured() -> bool:
     return bool(
-        os.environ.get("WP_REST_BASE_URL", "").strip()
+        rest_base_url_allowed(os.environ.get("WP_REST_BASE_URL", ""))
         and os.environ.get("WP_REST_USERNAME", "").strip()
         and os.environ.get("WP_REST_APPLICATION_PASSWORD", "").strip()
         and os.environ.get("WP_REST_ENABLED", "").strip().lower() in {"1", "true", "yes"}

@@ -6,6 +6,7 @@ from typing import BinaryIO
 
 from defusedxml import ElementTree as ET
 
+from .ids import wordpress_id
 from .models import Author, ContentItem, Term, WXRExport
 
 
@@ -74,10 +75,10 @@ def parse_wxr(file_stream: BinaryIO) -> WXRExport:
         if _local_name(element.tag) != "item":
             continue
 
-        post_id = _text(element, "post_id")
+        post_id = wordpress_id(_text(element, "post_id"))
         post_type = _text(element, "post_type")
         if not post_id or not post_type:
-            warnings.append("Skipped an export item with no WordPress ID or post type.")
+            warnings.append("Skipped an export item with no canonical WordPress ID or post type.")
             continue
         if post_id in seen_ids:
             warnings.append(f"Duplicate WordPress item ID {post_id} was found; URL resolution may be ambiguous.")

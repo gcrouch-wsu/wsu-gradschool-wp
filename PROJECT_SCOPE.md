@@ -20,7 +20,9 @@ The working application now:
 - Extracts references from content, excerpts, menus, parent relationships, featured images, attachment relationships, Gutenberg/block markup, shortcodes, and useful custom fields.
 - Separates strong, possible, and structural references and retains where-used evidence.
 - Identifies expected development content using configurable Greg Crouch author aliases without hiding that content.
-- Provides server-side search, filters, pagination, taxonomy drill-down, record details, in-memory review decisions, and filtered CSV/JSON exports.
+- Provides server-side search, filters, pagination, taxonomy drill-down, record details, in-memory review decisions, a cross-group work queue, and filtered CSV/JSON exports.
+- Locally, can check a group against live WordPress REST and move selected records to Trash after confirmation. Trash uses WordPress `DELETE` without `force`.
+- Treats published Events Calendar and graduate factsheet records as reachable from their public archives.
 - Escapes displayed content and protects CSV cells from spreadsheet formula injection.
 
 ## Current export results
@@ -39,7 +41,7 @@ The September 9, 2026 Graduate School export contains 6,599 raw records and 6,46
 | Graduate Factsheets | 213 | 196 | 177 | 2 |
 | Other Content | 195 | 192 | 159 | 0 |
 
-These are review counts, not deletion counts. A WXR-only finding must be verified before deletion.
+These are review counts, not deletion counts. A WXR-only finding must be verified before deletion. Published Events and graduate factsheets are now treated as archive-reachable, so those review counts from the September 9 export will drop after re-analysis.
 
 ## Content organization
 
@@ -60,7 +62,7 @@ Other groups expose the taxonomies that actually apply to them, such as Event Ca
 The tool deliberately uses several explainable conditions instead of one absolute “orphan” flag:
 
 1. **Unreferenced** — no meaningful inbound reference was found in the export.
-2. **Unreferenced media** — an attachment is not linked, embedded, used as a featured image, associated with a parent, or found in recognized metadata.
+2. **Unreferenced media** — an attachment is not linked, embedded, used as a featured image, or found in a recognized URL/custom-field reference. A parent/child association alone does not prove a rendered use.
 3. **Disconnected island** — references exist, but neither the record nor its sources are reachable from recognized site entry points.
 4. **Needs verification** — evidence is incomplete, indirect, or held in a structure that requires human/live-site confirmation.
 5. **Expected development** — the record matches an explicit development-author rule, currently Greg Crouch / `gcrouch`; its underlying finding remains available.
@@ -93,7 +95,7 @@ Consequently, “unreferenced in export” means exactly that. It is not equival
 
 - Stay local-only for WordPress REST credentials and writes. Never put `WP_REST_*` on Vercel.
 - Trash is opt-in (`WP_REST_WRITE_ENABLED`), confirmed in the UI, and never uses WordPress `force` delete.
-- Keep uploaded data and review decisions local and in memory for the current phase.
+- Keep uploaded data and review decisions local and in memory for the current local-dev phase. On Vercel, reports use private Blob storage; abandoned upload chunks still need TTL cleanup.
 - Parse XML with protections appropriate for untrusted uploads.
 - Preserve original evidence while normalizing URLs for matching.
 - Escape uploaded values in the interface.
@@ -110,6 +112,8 @@ wsu-gradschool-wp/
     wxr_parser.py           protected WXR parsing
     url_normalizer.py       URL matching variants
     analysis.py             extraction, graph, classification, grouping
+    wp_rest.py              local live-check and Trash client
+  local_env.py              local .env.local loader; Vercel never loads it
   templates/index.html      dashboard and upload workflow
   public/app.js             interactive filtering and chunked upload workflow
   public/styles.css         responsive WSU-oriented visual system
@@ -132,17 +136,49 @@ The analyzer is independent of Flask so it can be tested directly and later reus
 
 ### Phase 3 — Optional live confirmation
 
+Local REST live-check and confirmed Trash are already implemented. Remaining work:
+
 - Add an explicitly enabled, read-only crawl of the public site.
 - Compare live status codes, redirects, canonical URLs, links, embeds, and asset use with export findings.
 - Keep sitemap presence separate from genuine reachability.
-- Never submit forms, authenticate to WordPress, or mutate the site.
+- Never submit forms from a crawler. REST writes stay local, opt-in, Trash-only, and never use `force`.
 
 ### Phase 4 — Persistence and governance
 
 - Persist analysis runs and review decisions in a local database.
 - Record reviewer, timestamp, notes, and decision history.
 - Support comparison between exports to show additions, removals, and changed evidence.
-- Produce an approved action list for a separate, controlled WordPress cleanup process.
+- Produce an approved action list that can be executed through the existing local Trash path or a separate controlled WordPress cleanup process.
+
+### Phase 5 — REST-first inventory, export as deep audit
+
+A WXR export remains required for the current orphan/where-used graph. REST is a better source for “what is live right now.” Do not treat REST as a drop-in replacement for the export.
+
+**Intended shape:** hybrid, not REST-only.
+
+1. Open the dashboard from authenticated local REST and populate inventory, live status, and Trash without an upload.
+2. Keep the export, or an equivalent authenticated content crawl, as the optional source for the reference graph: where-used evidence, unreferenced media, and disconnected islands.
+3. Weaken or disable export-only findings when no snapshot is loaded, rather than guessing from titles and IDs.
+4. Use REST for smaller groups first (posts, pages, events). Media (~3,600), documents, and forms can stay export-backed until pagination and coverage are proven.
+5. Mark groups that REST cannot cover (TablePress, Gravity Forms definitions, some Other plugin types) as partial or unavailable.
+6. Keep all WordPress credentials and writes local. Never put `WP_REST_*` on Vercel.
+
+**Write preflight required before expanding REST-first inventory**
+
+- Bind the export or crawl to a verified site identity (canonical host) matching `WP_REST_BASE_URL`.
+- Re-fetch the current ID, type, title, and status from that site immediately before Trash.
+- Discover each endpoint’s schema, page size, and pagination; incomplete list responses are errors, not “missing.”
+- Represent REST vs WXR conflicts and completeness per field/group instead of silently preferring one source.
+- Use least-privilege, revocable Application Passwords; require HTTPS except loopback.
+- Define snapshot consistency, retry/rate-limit behavior, and stale-write protection before enabling REST-first writes.
+
+**Constraints this phase must respect**
+
+- A live catalog answers existence and status. It does not prove unused-everywhere.
+- Plugin REST quirks are expected (for example, The Events Calendar replacing the status enum so `POST status=trash` fails; Trash must stay `DELETE` without `force`).
+- Menus, rendered/block HTML, shortcodes, and useful meta are required for trustworthy orphan findings. Listing endpoints are not enough.
+- A full REST content crawl that downloads the same fields as WXR is acceptable; skipping the snapshot is not.
+- An “equivalent authenticated content crawl” cannot assume unregistered meta, menus, plugin tables, or rendered shortcode relationships are available.
 
 ## Success criteria
 

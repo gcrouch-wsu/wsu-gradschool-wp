@@ -121,3 +121,10 @@ def test_published_events_are_reachable_from_the_calendar_archive():
     assert rows["20"]["group"] == "events"
     assert rows["20"]["classification"] == "linked"
     assert rows["20"]["evidence"][0]["kind"] == "archive"
+
+
+def test_parser_skips_non_canonical_wordpress_ids():
+    hostile = WXR.replace(b"<wp:post_id>3</wp:post_id>", b"<wp:post_id>3?force=true</wp:post_id>")
+    export = parse_wxr(BytesIO(hostile))
+    assert all(item.id != "3?force=true" for item in export.items)
+    assert all(item.id != "3" or item.title != "Development page" for item in export.items)

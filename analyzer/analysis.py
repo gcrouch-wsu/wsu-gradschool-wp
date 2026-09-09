@@ -8,7 +8,7 @@ from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
 from .models import ContentItem, Reference, WXRExport
-from .url_normalizer import media_variant_keys, normalize_url, url_keys
+from .url_normalizer import media_variant_keys, normalize_url, public_href, url_keys
 from .wp_rest import wp_admin_edit_url
 
 
@@ -640,9 +640,9 @@ def analyze_export(
         groups.append(group)
 
     source_coverage = [
-        {"source": "WXR content and excerpts", "available": True, "detail": "Links, embeds, blocks, and shortcodes"},
+        {"source": "WXR content and excerpts", "available": True, "detail": "Links, embeds, selected media blocks, galleries, and URL-shaped text"},
         {"source": "Navigation menus", "available": bool(menu_items), "detail": f"{len(menu_items)} exported menu records"},
-        {"source": "Post custom fields", "available": True, "detail": "URL evidence and recognized relationship IDs"},
+        {"source": "Post custom fields", "available": True, "detail": "URL evidence and selected relationship IDs such as featured images"},
         {"source": "Attachment metadata", "available": True, "detail": "Paths, dimensions, ALT text, and generated variants when exported"},
         {"source": "Taxonomies", "available": True, "detail": "Typed terms and content assignments"},
         {"source": "Theme, widget, and site options", "available": False, "detail": "Not included in a standard WXR export"},
@@ -654,8 +654,8 @@ def analyze_export(
     return {
         "site": {
             "title": export.site_title,
-            "site_url": export.site_url,
-            "home_url": export.home_url,
+            "site_url": public_href(export.site_url),
+            "home_url": public_href(export.home_url),
             "description": export.description,
         },
         "stats": stats,

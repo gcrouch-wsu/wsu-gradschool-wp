@@ -130,6 +130,9 @@ def test_trash_is_disabled_during_tests_by_default():
 def test_confirmed_trash_updates_live_state(monkeypatch):
     deleted = []
 
+    def fake_get(url, _headers, _timeout):
+        return 200, {"id": 3, "status": "publish", "type": "page"}
+
     def fake_delete(url, _headers, _timeout):
         deleted.append(url)
         return 200, {
@@ -146,6 +149,7 @@ def test_confirmed_trash_updates_live_state(monkeypatch):
     monkeypatch.setenv("WP_REST_BASE_URL", "https://example.test")
     monkeypatch.setenv("WP_REST_USERNAME", "gcrouch")
     monkeypatch.setenv("WP_REST_APPLICATION_PASSWORD", "not-a-real-password")
+    monkeypatch.setattr("analyzer.wp_rest._http_get", fake_get)
     monkeypatch.setattr("analyzer.wp_rest._http_delete", fake_delete)
 
     client = _client_with_report()
@@ -161,3 +165,23 @@ def test_confirmed_trash_updates_live_state(monkeypatch):
     assert listing["total"] == 1
     assert listing["items"][0]["id"] == "3"
     assert listing["items"][0]["can_trash"] is False
+    hostile = client.post("/api/trash", json={"ids": ["3?force=true"], "confirm": "trash"})
+    assert hostile.status_code == 400
+
+
+def test_trash_refuses_export_from_a_different_site(monkeypatch):
+    def fail_delete(url, _headers, _timeout):
+        raise AssertionError("Trash must not run against a different WordPress site.")
+
+    monkeypatch.setenv("WP_REST_ALLOW_IN_TESTS", "1")
+    monkeypatch.setenv("WP_REST_ENABLED", "1")
+    monkeypatch.setenv("WP_REST_WRITE_ENABLED", "1")
+    monkeypatch.setenv("WP_REST_BASE_URL", "https://gradschool.wsu.edu")
+    monkeypatch.setenv("WP_REST_USERNAME", "gcrouch")
+    monkeypatch.setenv("WP_REST_APPLICATION_PASSWORD", "not-a-real-password")
+    monkeypatch.setattr("analyzer.wp_rest._http_delete", fail_delete)
+
+    client = _client_with_report()
+    response = client.post("/api/trash", json={"ids": ["3"], "confirm": "trash"})
+    assert response.status_code == 409
+    assert "not from the WordPress site" in response.get_json()["error"]

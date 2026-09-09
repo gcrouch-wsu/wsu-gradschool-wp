@@ -9,6 +9,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from .ids import rest_base_url_allowed, wordpress_id
+
 
 REST_BASES = {
     "post": "posts",
@@ -31,9 +33,10 @@ HttpDelete = Callable[[str, dict[str, str], int], tuple[int, Any]]
 
 
 def wp_admin_edit_url(site_url: str, item_id: str) -> str:
-    if not site_url or not item_id:
+    safe_id = wordpress_id(item_id)
+    if not site_url or not safe_id:
         return ""
-    return f"{site_url.rstrip('/')}/wp-admin/post.php?post={item_id}&action=edit"
+    return f"{site_url.rstrip('/')}/wp-admin/post.php?post={safe_id}&action=edit"
 
 
 def wp_admin_trash_url(site_url: str, post_type: str) -> str:
@@ -47,6 +50,18 @@ def wp_admin_trash_url(site_url: str, post_type: str) -> str:
 
 def rest_base_for(post_type: str) -> str | None:
     return REST_BASES.get(post_type)
+
+
+def safe_rest_base(value: str) -> str | None:
+    return value if value in set(REST_BASES.values()) else None
+
+
+def _resource_url(base_url: str, rest_base: str, item_id: str) -> str | None:
+    safe_base = safe_rest_base(rest_base)
+    safe_id = wordpress_id(item_id)
+    if not safe_base or not safe_id:
+        return None
+    return f"{base_url.rstrip('/')}/wp-json/wp/v2/{safe_base}/{safe_id}"
 
 
 def _read_json_response(raw: str, fallback: str) -> Any:
@@ -111,28 +126,43 @@ class WordPressRestClient:
             "Accept": "application/json",
             "User-Agent": "wsu-gradschool-wp-audit/local",
         }
+        if not rest_base_url_allowed(base_url):
+            raise ValueError("WordPress REST must use HTTPS, or HTTP only on loopback.")
         self.http_get = http_get or _http_get
         self.http_delete = http_delete or _http_delete
         self.timeout = timeout
 
     def list_type(self, rest_base: str, ids: list[str]) -> tuple[int, Any]:
+        safe_base = safe_rest_base(rest_base)
+        safe_ids = [item_id for item_id in (wordpress_id(value) for value in ids) if item_id]
+        if not safe_base or not safe_ids:
+            return 400, {"message": "WordPress REST route or include list is invalid."}
         # WordPress expects one CSV include list. Repeated include= keys collapse
         # to the last ID in PHP, which made a 306-page check report only 4 found.
         query = {
-            "include": ",".join(ids),
-            "per_page": str(min(len(ids), BATCH_SIZE)),
+            "include": ",".join(safe_ids),
+            "per_page": str(min(len(safe_ids), BATCH_SIZE)),
             # `any` excludes trash and auto-draft in WordPress REST.
             "status": "any,trash",
             "context": "edit",
             "_fields": "id,status,link,modified,type",
         }
-        url = f"{self.base_url}/wp-json/wp/v2/{rest_base}?{urlencode(query)}"
+        url = f"{self.base_url}/wp-json/wp/v2/{safe_base}?{urlencode(query)}"
         return self.http_get(url, self.headers, self.timeout)
+
+    def get_item(self, rest_base: str, item_id: str) -> tuple[int, Any]:
+        url = _resource_url(self.base_url, rest_base, item_id)
+        if not url:
+            return 400, {"message": "WordPress ID or REST route is invalid."}
+        query = urlencode({"context": "edit", "_fields": "id,status,type,title,link,modified"})
+        return self.http_get(f"{url}?{query}", self.headers, self.timeout)
 
     def trash(self, rest_base: str, item_id: str) -> tuple[int, Any]:
         # WordPress Trash is DELETE without force. POST status=trash is rejected
         # on this site because The Events Calendar replaces the REST status enum.
-        url = f"{self.base_url}/wp-json/wp/v2/{rest_base}/{item_id}"
+        url = _resource_url(self.base_url, rest_base, item_id)
+        if not url:
+            return 400, {"message": "WordPress ID or REST route is invalid."}
         return self.http_delete(url, self.headers, self.timeout)
 
 
@@ -247,9 +277,17 @@ def trash_items(
     """Move exported records to WordPress Trash. Never force-deletes."""
     results: list[dict] = []
     for item in items:
-        item_id = str(item["id"])
+        item_id = wordpress_id(item.get("id"))
         rest_base = rest_base_for(item.get("type", ""))
-        title = str(item.get("title") or item.get("file_name") or f"ID {item_id}")
+        title = str(item.get("title") or item.get("file_name") or f"ID {item.get('id')}")
+        if not item_id:
+            results.append({
+                "id": str(item.get("id") or ""),
+                "ok": False,
+                "title": title,
+                "error": "WordPress ID is not a canonical positive integer.",
+            })
+            continue
         if not rest_base:
             results.append({
                 "id": item_id,
@@ -258,10 +296,34 @@ def trash_items(
                 "error": "This content type is not available through WordPress REST, so it cannot be trashed from this app.",
             })
             continue
+        preflight_status, current = client.get_item(rest_base, item_id)
+        if preflight_status in {401, 403}:
+            message = _payload_message(current, "WordPress refused authenticated REST access.")
+            results.append({"id": item_id, "ok": False, "title": title, "error": message})
+            break
+        if preflight_status != 200 or not isinstance(current, dict) or str(current.get("id")) != item_id:
+            results.append({
+                "id": item_id,
+                "ok": False,
+                "title": title,
+                "error": "Could not re-read this record from the configured WordPress site before Trash.",
+            })
+            continue
+        live_type = str(current.get("type") or "")
+        expected_type = str(item.get("type") or "")
+        if live_type and expected_type and live_type != expected_type:
+            results.append({
+                "id": item_id,
+                "ok": False,
+                "title": title,
+                "error": f"Live WordPress type {live_type} does not match the exported type {expected_type}.",
+            })
+            continue
         status, payload = client.trash(rest_base, item_id)
         if status in {401, 403}:
             message = _payload_message(payload, "WordPress refused authenticated REST access.")
-            raise PermissionError(message)
+            results.append({"id": item_id, "ok": False, "title": title, "error": message})
+            break
         if status in {200, 201} and isinstance(payload, dict):
             live_status = str(payload.get("status") or "")
             if live_status != "trash":
