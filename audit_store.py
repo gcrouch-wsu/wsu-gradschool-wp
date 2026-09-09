@@ -16,6 +16,7 @@ class AuditStore:
         self._chunks: dict[tuple[str, int], bytes] = {}
         self._reports: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._decisions: dict[str, dict[str, str]] = {}
+        self._live: dict[str, dict[str, dict]] = {}
         self._lock = RLock()
 
     @property
@@ -33,6 +34,10 @@ class AuditStore:
     @staticmethod
     def _decisions_path(audit_id: str) -> str:
         return f"audits/{audit_id}/decisions.json"
+
+    @staticmethod
+    def _live_path(audit_id: str) -> str:
+        return f"audits/{audit_id}/live.json"
 
     @staticmethod
     def _client():
@@ -94,6 +99,7 @@ class AuditStore:
                     multipart=len(body) > 4 * 1024 * 1024,
                 )
         self.save_decisions(audit_id, {})
+        self.save_live(audit_id, {})
 
     def load_report(self, audit_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -140,24 +146,54 @@ class AuditStore:
         with self._lock:
             self._decisions[audit_id] = dict(decisions)
 
+    def load_live(self, audit_id: str) -> dict[str, dict]:
+        if not self.blob_enabled:
+            with self._lock:
+                return dict(self._live.get(audit_id, {}))
+        from vercel.blob.errors import BlobNotFoundError
+        try:
+            with self._client() as client:
+                result = client.get(self._live_path(audit_id), access="private", use_cache=False)
+        except BlobNotFoundError:
+            return {}
+        return json.loads(result.content.decode("utf-8")) if result is not None else {}
+
+    def save_live(self, audit_id: str, live: dict[str, dict]) -> None:
+        if self.blob_enabled:
+            with self._client() as client:
+                client.put(
+                    self._live_path(audit_id),
+                    json.dumps(live, separators=(",", ":")).encode("utf-8"),
+                    access="private", content_type="application/json", overwrite=True,
+                    cache_control_max_age=60,
+                )
+            return
+        with self._lock:
+            self._live[audit_id] = dict(live)
+
     def load_state(self, audit_id: str | None) -> dict[str, Any] | None:
         if not audit_id:
             return None
         state = self.load_report(audit_id)
         if state is None:
             return None
-        return {**state, "decisions": self.load_decisions(audit_id)}
+        return {
+            **state,
+            "decisions": self.load_decisions(audit_id),
+            "live": self.load_live(audit_id),
+        }
 
     def delete_audit(self, audit_id: str | None, total_chunks: int = 0) -> None:
         if not audit_id:
             return
         if self.blob_enabled:
-            paths = [self._report_path(audit_id), self._decisions_path(audit_id)]
+            paths = [self._report_path(audit_id), self._decisions_path(audit_id), self._live_path(audit_id)]
             paths.extend(self._chunk_path(audit_id, index) for index in range(total_chunks))
             with self._client() as client:
                 client.delete(paths)
         with self._lock:
             self._reports.pop(audit_id, None)
             self._decisions.pop(audit_id, None)
+            self._live.pop(audit_id, None)
             for key in [key for key in self._chunks if key[0] == audit_id]:
                 self._chunks.pop(key, None)

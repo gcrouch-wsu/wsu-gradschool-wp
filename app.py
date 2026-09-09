@@ -14,7 +14,9 @@ from flask import Flask, Response, jsonify, render_template, request, session
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from analyzer import analyze_export, parse_wxr
+from analyzer.wp_rest import MAX_TRASH_BATCH, client_from_env, live_check_items, rest_base_for, trash_items
 from audit_store import AuditStore
+from local_env import load_local_env, rest_enabled, rest_write_enabled
 
 
 MAX_UPLOAD_BYTES = 250 * 1024 * 1024
@@ -31,6 +33,8 @@ FINDING_PRIORITY = {
     "non-public": 5,
     "linked": 6,
 }
+QUEUE_FINDINGS = {"unreferenced", "unreferenced-media", "disconnected"}
+QUEUE_LIVE_STATES = {"missing", "trashed"}
 
 
 def _expected_author_aliases() -> set[str]:
@@ -56,6 +60,7 @@ def _spreadsheet_safe(value) -> str:
 
 
 def create_app() -> Flask:
+    load_local_env()
     app = Flask(__name__, static_folder="public", static_url_path="")
     app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
     app.secret_key = (
@@ -79,6 +84,18 @@ def create_app() -> Flask:
         response.headers["X-Frame-Options"] = "DENY"
         return response
 
+    def rest_available() -> bool:
+        return rest_enabled(testing=bool(app.config.get("TESTING")))
+
+    def write_available() -> bool:
+        return rest_write_enabled(testing=bool(app.config.get("TESTING")))
+
+    def rest_context():
+        return {
+            "rest_enabled": rest_available(),
+            "rest_write_enabled": write_available(),
+        }
+
     def latest_state():
         return audit_store.load_state(session.get("audit_id"))
 
@@ -94,6 +111,7 @@ def create_app() -> Flask:
     def filtered_rows(report: dict) -> list[dict]:
         rows = report["items"]
         group = request.args.get("group", "")
+        queue_mode = request.args.get("queue", "").strip().lower() in {"1", "true", "yes"}
         classification = request.args.get("classification", "")
         status = request.args.get("status", "")
         author = request.args.get("author", "")
@@ -102,13 +120,24 @@ def create_app() -> Flask:
         taxonomy = request.args.get("taxonomy", "")
         term = request.args.get("term", "")
         decision = request.args.get("decision", "")
+        live_filter = request.args.get("live", "")
         query = request.args.get("q", "").strip().casefold()
         current_state = latest_state()
         decisions = current_state["decisions"] if current_state else {}
+        live = current_state["live"] if current_state else {}
 
         result = []
         for row in rows:
             if group and row["group"] != group:
+                continue
+            live_state = (live.get(row["id"]) or {}).get("live_state") or "unchecked"
+            row_decision = decisions.get(row["id"], "unreviewed")
+            findings = {row["classification"], row.get("underlying_classification") or row["classification"]}
+            if queue_mode and (
+                findings.isdisjoint(QUEUE_FINDINGS)
+                and live_state not in QUEUE_LIVE_STATES
+                and row_decision not in {"candidate", "approved"}
+            ):
                 continue
             if classification and row["classification"] != classification:
                 continue
@@ -124,8 +153,9 @@ def create_app() -> Flask:
                 continue
             if term and term not in row["taxonomy_terms"].get(taxonomy, []):
                 continue
-            row_decision = decisions.get(row["id"], "unreviewed")
             if decision and row_decision != decision:
+                continue
+            if live_filter and live_state != live_filter:
                 continue
             if query:
                 searchable = " ".join(
@@ -153,17 +183,55 @@ def create_app() -> Flask:
             result.sort(key=lambda row: (FINDING_PRIORITY.get(row["classification"], 99), row["title"].casefold()))
         return result
 
-    def list_payload(row: dict, decisions: dict[str, str]) -> dict:
+    def list_payload(row: dict, decisions: dict[str, str], live: dict[str, dict]) -> dict:
         fields = (
             "id", "group", "group_label", "type", "content_class", "title", "url",
-            "file_name", "file_size", "width", "height", "mime_type", "file_extension",
+            "wp_admin_url", "file_name", "file_size", "width", "height", "mime_type", "file_extension",
             "author_name", "author_login", "status", "created", "modified", "categories",
             "tags", "taxonomy_terms", "classification", "underlying_classification",
             "confidence", "inbound_strong", "inbound_possible", "inbound_structural",
             "outbound", "expected_development", "derivative_count",
         )
-        payload = {field: row[field] for field in fields}
+        payload = {field: row.get(field) for field in fields}
         payload["review_decision"] = decisions.get(row["id"], "unreviewed")
+        record = live.get(row["id"]) or {}
+        payload["live_state"] = record.get("live_state") or "unchecked"
+        payload["live_status"] = record.get("live_status") or ""
+        payload["live_link"] = record.get("live_link") or ""
+        payload["live_found"] = bool(record.get("live_found"))
+        payload["can_trash"] = bool(
+            rest_base_for(row.get("type", ""))
+            and payload["live_state"] not in {"trashed", "not-in-rest"}
+        )
+        if record.get("wp_admin_url"):
+            payload["wp_admin_url"] = record["wp_admin_url"]
+        return payload
+
+    def merge_live(row: dict, decisions: dict[str, str], live: dict[str, dict]) -> dict:
+        exported = dict(row)
+        exported["review_decision"] = decisions.get(row["id"], "unreviewed")
+        record = live.get(row["id"]) or {}
+        exported["live_state"] = record.get("live_state") or "unchecked"
+        exported["live_status"] = record.get("live_status") or ""
+        exported["live_link"] = record.get("live_link") or ""
+        exported["live_found"] = bool(record.get("live_found"))
+        exported["live_error"] = record.get("error") or ""
+        exported["live_checked_at"] = record.get("checked_at") or ""
+        exported["can_trash"] = bool(
+            rest_base_for(row.get("type", ""))
+            and exported["live_state"] not in {"trashed", "not-in-rest"}
+        )
+        if record.get("wp_admin_url"):
+            exported["wp_admin_url"] = record["wp_admin_url"]
+        return exported
+
+    def template_kwargs(**extra):
+        payload = {
+            "storage_mode": audit_store.mode,
+            "chunk_size": UPLOAD_CHUNK_BYTES,
+            **rest_context(),
+        }
+        payload.update(extra)
         return payload
 
     @app.route("/", methods=["GET", "POST"])
@@ -172,35 +240,39 @@ def create_app() -> Flask:
             state = latest_state()
             return render_template(
                 "index.html",
-                report=state["report"] if state else None,
-                error=None,
-                filename=state["filename"] if state else None,
-                storage_mode=audit_store.mode,
-                chunk_size=UPLOAD_CHUNK_BYTES,
+                **template_kwargs(
+                    report=state["report"] if state else None,
+                    error=None,
+                    filename=state["filename"] if state else None,
+                ),
             )
 
         uploaded = request.files.get("export_file")
         if uploaded is None or not uploaded.filename:
             return render_template(
-                "index.html", report=None,
-                error="Choose a WordPress WXR (.xml) export before starting the analysis.",
-                filename=None,
-                storage_mode=audit_store.mode, chunk_size=UPLOAD_CHUNK_BYTES,
+                "index.html",
+                **template_kwargs(
+                    report=None,
+                    error="Choose a WordPress WXR (.xml) export before starting the analysis.",
+                    filename=None,
+                ),
             ), 400
         if not uploaded.filename.lower().endswith(".xml"):
             return render_template(
-                "index.html", report=None,
-                error="The selected file must be a WordPress XML export.",
-                filename=uploaded.filename,
-                storage_mode=audit_store.mode, chunk_size=UPLOAD_CHUNK_BYTES,
+                "index.html",
+                **template_kwargs(
+                    report=None,
+                    error="The selected file must be a WordPress XML export.",
+                    filename=uploaded.filename,
+                ),
             ), 400
 
         try:
             audit_id = uuid4().hex
             report = analyze_and_store(uploaded.stream, uploaded.filename, audit_id)
             return render_template(
-                "index.html", report=report, error=None, filename=uploaded.filename,
-                storage_mode=audit_store.mode, chunk_size=UPLOAD_CHUNK_BYTES,
+                "index.html",
+                **template_kwargs(report=report, error=None, filename=uploaded.filename),
             )
         except (DefusedXmlException, ValueError) as exc:
             message = f"The export could not be analyzed: {exc}"
@@ -208,8 +280,8 @@ def create_app() -> Flask:
             app.logger.exception("Unexpected WXR analysis failure")
             message = "The export could not be analyzed because of an unexpected parsing error."
         return render_template(
-            "index.html", report=None, error=message, filename=uploaded.filename,
-            storage_mode=audit_store.mode, chunk_size=UPLOAD_CHUNK_BYTES,
+            "index.html",
+            **template_kwargs(report=None, error=message, filename=uploaded.filename),
         ), 400
 
     @app.post("/api/upload-session")
@@ -305,6 +377,7 @@ def create_app() -> Flask:
         page_size = _integer_arg("page_size", 50, 10, MAX_PAGE_SIZE)
         start = (page - 1) * page_size
         decisions = state["decisions"]
+        live = state["live"]
         facets = {
             "authors": sorted({row["author_name"] or row["author_login"] or "Unknown" for row in all_group_rows}, key=str.casefold),
             "statuses": sorted({row["status"] or "unknown" for row in all_group_rows}),
@@ -312,15 +385,19 @@ def create_app() -> Flask:
             "subtypes": sorted({row["content_class"] for row in all_group_rows}),
             "file_types": sorted({(row.get("file_extension") or "<none>").lower() for row in all_group_rows}),
             "decisions": sorted(REVIEW_DECISIONS),
+            "live": ["unchecked", "found", "trashed", "missing", "not-in-rest", "error"],
         }
         return jsonify(
             {
-                "items": [list_payload(row, decisions) for row in rows[start:start + page_size]],
+                "items": [list_payload(row, decisions, live) for row in rows[start:start + page_size]],
                 "total": len(rows),
                 "page": page,
                 "page_size": page_size,
                 "page_count": max(1, (len(rows) + page_size - 1) // page_size),
                 "facets": facets,
+                "rest_enabled": rest_available(),
+                "rest_write_enabled": write_available(),
+                "queue": request.args.get("queue", "").strip().lower() in {"1", "true", "yes"},
             }
         )
 
@@ -332,8 +409,7 @@ def create_app() -> Flask:
         row = next((row for row in state["report"]["items"] if row["id"] == item_id), None)
         if row is None:
             return jsonify({"error": "Item not found."}), 404
-        payload = dict(row)
-        payload["review_decision"] = state["decisions"].get(item_id, "unreviewed")
+        payload = merge_live(row, state["decisions"], state["live"])
         return jsonify(payload)
 
     @app.get("/api/taxonomies/<group_id>")
@@ -361,6 +437,101 @@ def create_app() -> Flask:
         audit_store.save_decisions(session["audit_id"], state["decisions"])
         return jsonify({"id": item_id, "decision": decision})
 
+    @app.post("/api/live-check")
+    def api_live_check():
+        if not rest_available():
+            return jsonify({"error": "Local WordPress REST is not configured."}), 403
+        state = latest_state()
+        if not state:
+            return jsonify({"error": "No export has been analyzed."}), 404
+        data = request.get_json(silent=True) or {}
+        group = str(data.get("group") or request.args.get("group") or "").strip()
+        items = [
+            row for row in state["report"]["items"]
+            if not group or row["group"] == group
+        ]
+        try:
+            site = state["report"].get("site") or {}
+            site_url = site.get("site_url") or site.get("home_url") or ""
+            results = live_check_items(items, client_from_env(), site_url=site_url)
+        except PermissionError as exc:
+            return jsonify({"error": str(exc)}), 403
+        except Exception:
+            app.logger.exception("WordPress REST live check failed")
+            return jsonify({"error": "The WordPress live check failed."}), 500
+        live = dict(state["live"])
+        live.update(results)
+        audit_store.save_live(session["audit_id"], live)
+        counts = {
+            "checked": len(results),
+            "found": sum(item["live_state"] == "found" for item in results.values()),
+            "trashed": sum(item["live_state"] == "trashed" for item in results.values()),
+            "missing": sum(item["live_state"] == "missing" for item in results.values()),
+            "not_in_rest": sum(item["live_state"] == "not-in-rest" for item in results.values()),
+            "error": sum(item["live_state"] == "error" for item in results.values()),
+        }
+        return jsonify({"ok": True, "group": group, **counts})
+
+    @app.post("/api/trash")
+    def api_trash():
+        if not write_available():
+            return jsonify({"error": "Local WordPress Trash is not enabled. Set WP_REST_WRITE_ENABLED=1 in .env.local."}), 403
+        state = latest_state()
+        if not state:
+            return jsonify({"error": "No export has been analyzed."}), 404
+        data = request.get_json(silent=True) or {}
+        if str(data.get("confirm") or "") != "trash":
+            return jsonify({"error": "Confirm moving these records to WordPress Trash."}), 400
+        raw_ids = data.get("ids") or []
+        if not isinstance(raw_ids, list):
+            return jsonify({"error": "Choose one or more records to move to Trash."}), 400
+        ids = [str(item_id).strip() for item_id in raw_ids if str(item_id).strip()]
+        if not ids:
+            return jsonify({"error": "Choose one or more records to move to Trash."}), 400
+        if len(ids) > MAX_TRASH_BATCH:
+            return jsonify({"error": f"Move at most {MAX_TRASH_BATCH} records to Trash at a time."}), 400
+        by_id = {row["id"]: row for row in state["report"]["items"]}
+        missing = [item_id for item_id in ids if item_id not in by_id]
+        if missing:
+            return jsonify({"error": f"Unknown record ID: {missing[0]}."}), 404
+        already = [
+            item_id for item_id in ids
+            if (state["live"].get(item_id) or {}).get("live_state") == "trashed"
+        ]
+        if already:
+            return jsonify({"error": f"Record {already[0]} is already in WordPress Trash."}), 400
+        unsupported = [item_id for item_id in ids if not rest_base_for(by_id[item_id].get("type", ""))]
+        if unsupported:
+            return jsonify({"error": f"Record {unsupported[0]} cannot be trashed through WordPress REST."}), 400
+        items = [by_id[item_id] for item_id in ids]
+        try:
+            site = state["report"].get("site") or {}
+            site_url = site.get("site_url") or site.get("home_url") or ""
+            results = trash_items(items, client_from_env(), site_url=site_url)
+        except PermissionError as exc:
+            return jsonify({"error": str(exc)}), 403
+        except Exception:
+            app.logger.exception("WordPress REST trash failed")
+            return jsonify({"error": "Moving records to WordPress Trash failed."}), 500
+        live = dict(state["live"])
+        for result in results:
+            if result.get("ok") and result.get("live"):
+                live[result["id"]] = result["live"]
+        audit_store.save_live(session["audit_id"], live)
+        if not any(result["ok"] for result in results):
+            return jsonify({
+                "error": results[0]["error"] if results else "Moving records to WordPress Trash failed.",
+                "trashed": 0,
+                "failed": len(results),
+                "results": results,
+            }), 400
+        return jsonify({
+            "ok": all(result["ok"] for result in results),
+            "trashed": sum(result["ok"] for result in results),
+            "failed": sum(not result["ok"] for result in results),
+            "results": results,
+        })
+
     @app.get("/api/export.<format_name>")
     def api_export(format_name: str):
         state = latest_state()
@@ -368,15 +539,14 @@ def create_app() -> Flask:
             return jsonify({"error": "No export has been analyzed."}), 404
         rows = filtered_rows(state["report"])
         decisions = state["decisions"]
+        live = state["live"]
         if format_name == "json":
             def generate_json():
                 yield "[\n"
                 for index, row in enumerate(rows):
-                    exported_row = dict(row)
-                    exported_row["review_decision"] = decisions.get(row["id"], "unreviewed")
                     if index:
                         yield ",\n"
-                    yield json.dumps(exported_row, ensure_ascii=False, separators=(",", ":"))
+                    yield json.dumps(merge_live(row, decisions, live), ensure_ascii=False, separators=(",", ":"))
                 yield "\n]\n"
 
             return Response(
@@ -388,14 +558,14 @@ def create_app() -> Flask:
             return jsonify({"error": "Unsupported export format."}), 404
 
         fields = (
-            "id", "group_label", "type", "content_class", "title", "url", "file_name",
-            "mime_type", "file_extension", "file_size", "width", "height", "stored_path",
+            "id", "group_label", "type", "content_class", "title", "url", "wp_admin_url",
+            "file_name", "mime_type", "file_extension", "file_size", "width", "height", "stored_path",
             "alt_text", "caption", "derivative_count", "status", "author_name", "author_login",
             "author_email", "created", "created_gmt", "modified", "modified_gmt", "parent_id",
             "categories", "tags", "taxonomies", "taxonomy_terms", "meta_keys",
             "classification", "underlying_classification", "confidence", "reasons", "recommendation",
             "inbound_strong", "inbound_possible", "inbound_structural", "outbound",
-            "review_decision",
+            "review_decision", "live_state", "live_status", "live_link", "live_checked_at",
         )
         def generate_csv():
             output = io.StringIO(newline="")
@@ -405,9 +575,7 @@ def create_app() -> Flask:
             for row in rows:
                 output.seek(0)
                 output.truncate(0)
-                exported_row = dict(row)
-                exported_row["review_decision"] = decisions.get(row["id"], "unreviewed")
-                writer.writerow({field: _spreadsheet_safe(exported_row.get(field)) for field in fields})
+                writer.writerow({field: _spreadsheet_safe(merge_live(row, decisions, live).get(field)) for field in fields})
                 yield output.getvalue()
 
         return Response(
@@ -419,9 +587,12 @@ def create_app() -> Flask:
     @app.errorhandler(RequestEntityTooLarge)
     def too_large(_error):
         return render_template(
-            "index.html", report=None,
-            error="The selected export is larger than the 250 MB upload limit.", filename=None,
-            storage_mode=audit_store.mode, chunk_size=UPLOAD_CHUNK_BYTES,
+            "index.html",
+            **template_kwargs(
+                report=None,
+                error="The selected export is larger than the 250 MB upload limit.",
+                filename=None,
+            ),
         ), 413
 
     return app

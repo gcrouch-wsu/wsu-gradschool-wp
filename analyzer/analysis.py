@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 
 from .models import ContentItem, Reference, WXRExport
 from .url_normalizer import media_variant_keys, normalize_url, url_keys
+from .wp_rest import wp_admin_edit_url
 
 
 URL_RE = re.compile(r"(?:https?:)?//[^\s\"'<>\\]+", re.IGNORECASE)
@@ -95,6 +96,12 @@ GROUP_CONFIG = {
         "description": "Plugin and supporting content types",
         "order": 90,
     },
+}
+
+# Published records of these types are reachable from their native archives.
+ARCHIVE_ENTRY_TYPES = {
+    "tribe_events": "Events Calendar archive",
+    "gs-factsheet": "Graduate factsheet archive",
 }
 
 SERIALIZED_INT_RE = re.compile(r's:(\d+):"(?P<key>[^"]+)";i:(?P<value>\d+);')
@@ -300,6 +307,18 @@ def analyze_export(
         roots.update(url_map.get(key, set()))
 
     for item in reportable.values():
+        if item.post_type in ARCHIVE_ENTRY_TYPES and item.status == "publish":
+            roots.add(item.id)
+            add_reference(
+                f"archive:{item.post_type}",
+                item.id,
+                "archive",
+                "post_type_archive",
+                "strong",
+                ARCHIVE_ENTRY_TYPES[item.post_type],
+            )
+
+    for item in reportable.values():
         if item.parent_id and item.parent_id != "0":
             add_reference(item.parent_id, item.id, "parent", "post_parent", "structural", item.parent_id)
 
@@ -397,7 +416,7 @@ def analyze_export(
             base_classification = "linked"
             confidence = "high"
             recommendation = "Keep unless content review indicates otherwise."
-            reasons.append("Reachable from an exported menu, the site home URL, or linked reachable content.")
+            reasons.append("Reachable from an exported menu, the site home URL, a public content archive, or linked reachable content.")
         elif is_media and strong_inbound:
             base_classification = "linked"
             confidence = "high"
@@ -443,10 +462,18 @@ def analyze_export(
         evidence = []
         for reference in sorted(inbound, key=lambda ref: (ref.strength, ref.kind, ref.source_id)):
             source = by_id.get(reference.source_id)
+            if source:
+                source_title = source.title
+            elif reference.kind == "archive":
+                source_title = "Public content archive"
+            elif reference.kind == "menu":
+                source_title = "Navigation menu"
+            else:
+                source_title = "Site entry point"
             evidence.append(
                 {
                     "source_id": reference.source_id,
-                    "source_title": source.title if source else "Navigation menu",
+                    "source_title": source_title,
                     "kind": reference.kind,
                     "field": reference.field,
                     "strength": reference.strength,
@@ -478,6 +505,7 @@ def analyze_export(
             "title": item.title,
             "slug": item.slug,
             "url": primary_url,
+            "wp_admin_url": wp_admin_edit_url(base_url, item.id),
             "status": item.status,
             "author_login": item.author_login,
             "author_name": item.author_name,

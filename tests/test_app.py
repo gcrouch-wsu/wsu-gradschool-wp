@@ -22,6 +22,8 @@ def test_paginated_group_api_and_lazy_detail():
     listing = client.get("/api/items?group=pages&page_size=25").get_json()
     assert listing["total"] == 3
     assert listing["items"][0]["group"] == "pages"
+    assert listing["items"][0]["live_state"] == "unchecked"
+    assert "/wp-admin/post.php?post=" in listing["items"][0]["wp_admin_url"]
     detail = client.get("/api/items/3").get_json()
     assert detail["author_name"] == "Greg Crouch"
     assert detail["underlying_classification"] == "unreferenced"
@@ -58,7 +60,104 @@ def test_chunked_upload_survives_separate_requests_and_can_be_removed():
     assert uploaded.status_code == 200
     completed = client.post("/api/complete-upload")
     assert completed.status_code == 200
-    assert completed.get_json()["records"] == 4
+    assert completed.get_json()["records"] == 5
     assert client.get("/api/items?group=media").get_json()["total"] == 1
     assert client.delete("/api/audit").status_code == 200
     assert client.get("/api/items").status_code == 404
+
+
+def test_live_check_is_disabled_during_tests_by_default():
+    client = _client_with_report()
+    response = client.post("/api/live-check", json={"group": "pages"})
+    assert response.status_code == 403
+
+
+def test_live_check_merges_read_only_wordpress_status(monkeypatch):
+    def fake_get(url, _headers, _timeout):
+        if "/pages?" in url:
+            return 200, [{
+                "id": 1,
+                "status": "publish",
+                "link": "https://example.test/landing",
+                "modified": "2026-01-02T00:00:00",
+                "type": "page",
+            }]
+        return 200, []
+
+    monkeypatch.setenv("WP_REST_ALLOW_IN_TESTS", "1")
+    monkeypatch.setenv("WP_REST_ENABLED", "1")
+    monkeypatch.setenv("WP_REST_BASE_URL", "https://example.test")
+    monkeypatch.setenv("WP_REST_USERNAME", "gcrouch")
+    monkeypatch.setenv("WP_REST_APPLICATION_PASSWORD", "not-a-real-password")
+    monkeypatch.setattr("analyzer.wp_rest._http_get", fake_get)
+
+    client = _client_with_report()
+    checked = client.post("/api/live-check", json={"group": "pages"})
+    assert checked.status_code == 200
+    payload = checked.get_json()
+    assert payload["checked"] == 3
+    assert payload["found"] == 1
+    assert payload["missing"] == 2
+
+    listing = client.get("/api/items?group=pages&live=found").get_json()
+    assert listing["total"] == 1
+    assert listing["items"][0]["id"] == "1"
+    assert listing["items"][0]["live_status"] == "publish"
+    exported = client.get("/api/export.csv?group=pages&live=missing")
+    assert exported.status_code == 200
+    assert b"wp_admin_url" in exported.data
+    assert b"Development page" in exported.data
+
+
+def test_work_queue_includes_unreferenced_and_missing_live_records():
+    client = _client_with_report()
+    marked = client.post("/api/items/1/decision", json={"decision": "approved"})
+    assert marked.status_code == 200
+    queue = client.get("/api/items?queue=1").get_json()
+    ids = {item["id"] for item in queue["items"]}
+    assert "1" in ids
+    assert "3" in ids
+    assert queue["total"] >= 2
+    assert queue["queue"] is True
+
+
+def test_trash_is_disabled_during_tests_by_default():
+    client = _client_with_report()
+    response = client.post("/api/trash", json={"ids": ["3"], "confirm": "trash"})
+    assert response.status_code == 403
+
+
+def test_confirmed_trash_updates_live_state(monkeypatch):
+    deleted = []
+
+    def fake_delete(url, _headers, _timeout):
+        deleted.append(url)
+        return 200, {
+            "id": 3,
+            "status": "trash",
+            "type": "page",
+            "link": "https://example.test/dev",
+            "modified": "2026-01-02T00:00:00",
+        }
+
+    monkeypatch.setenv("WP_REST_ALLOW_IN_TESTS", "1")
+    monkeypatch.setenv("WP_REST_ENABLED", "1")
+    monkeypatch.setenv("WP_REST_WRITE_ENABLED", "1")
+    monkeypatch.setenv("WP_REST_BASE_URL", "https://example.test")
+    monkeypatch.setenv("WP_REST_USERNAME", "gcrouch")
+    monkeypatch.setenv("WP_REST_APPLICATION_PASSWORD", "not-a-real-password")
+    monkeypatch.setattr("analyzer.wp_rest._http_delete", fake_delete)
+
+    client = _client_with_report()
+    refused = client.post("/api/trash", json={"ids": ["3"]})
+    assert refused.status_code == 400
+    trashed = client.post("/api/trash", json={"ids": ["3"], "confirm": "trash"})
+    assert trashed.status_code == 200
+    payload = trashed.get_json()
+    assert payload["trashed"] == 1
+    assert deleted[0].endswith("/wp-json/wp/v2/pages/3")
+    assert "force" not in deleted[0]
+    listing = client.get("/api/items?group=pages&live=trashed").get_json()
+    assert listing["total"] == 1
+    assert listing["items"][0]["id"] == "3"
+    assert listing["items"][0]["can_trash"] is False

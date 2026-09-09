@@ -40,6 +40,8 @@ The browser sends the export in 3 MB requests. The function writes those chunks 
 
 Optional: add `WP_EXPECTED_DEVELOPMENT_AUTHORS` if the default `greg crouch,gcrouch` aliases need to be changed.
 
+Never add `WP_REST_USERNAME`, `WP_REST_APPLICATION_PASSWORD`, `WP_REST_ENABLED`, or `WP_REST_WRITE_ENABLED` to Vercel. Live WordPress REST and Trash are local-only.
+
 ## 4. Protect the application
 
 The export contains non-public content and author metadata. Do not operate this as an unrestricted public website.

@@ -16,7 +16,9 @@
         <span class="wordmark-product">Graduate School · Content Audit</span>
       </a>
       <div class="header-meta">
-        <span class="privacy-chip"><i aria-hidden="true"></i>{{ 'Private audit storage' if storage_mode == 'blob' else 'Local and read-only' }}</span>
+        <span class="privacy-chip"><i aria-hidden="true"></i>{{ 'Private audit storage' if storage_mode == 'blob' else 'Local memory' }}</span>
+        {% if rest_write_enabled %}<span class="privacy-chip"><i aria-hidden="true"></i>Local REST can trash</span>
+        {% elif rest_enabled %}<span class="privacy-chip"><i aria-hidden="true"></i>Local REST read-only</span>{% endif %}
         {% if report %}<button class="button button-ghost" id="new-analysis" type="button">New export</button>{% endif %}
       </div>
     </div>
@@ -30,7 +32,13 @@
           <h1>Understand what exists.<br>Decide what stays.</h1>
           <p>Turn a WordPress site export into a structured inventory of pages, posts, events, media, documents, tables, forms, and their relationships.</p>
           <ul class="assurance-list">
-            <li>Nothing is written to WordPress</li>
+            {% if rest_write_enabled %}
+              <li>Trash in WordPress is local-only, confirmed, and reversible</li>
+            {% elif rest_enabled %}
+              <li>Live checks are local and read-only</li>
+            {% else %}
+              <li>Nothing is written to WordPress</li>
+            {% endif %}
             <li>Every finding retains its evidence</li>
             {% if storage_mode == 'blob' %}
               <li>Raw XML chunks are removed after analysis</li>
@@ -101,6 +109,7 @@
               <p id="active-group-description"></p>
             </div>
             <div class="workspace-actions">
+              {% if rest_enabled %}<button class="button button-primary" id="live-check" type="button">Check this group live</button>{% endif %}
               <a class="button button-outline" id="export-csv" href="/api/export.csv">Export CSV</a>
               <a class="button button-outline" id="export-json" href="/api/export.json">Export JSON</a>
             </div>
@@ -110,6 +119,7 @@
 
           <nav class="workspace-tabs" aria-label="Audit views">
             <button class="workspace-tab is-active" type="button" data-panel="content-panel">Content</button>
+            <button class="workspace-tab" type="button" data-panel="content-panel" data-queue="1">Work queue <span id="queue-tab-count"></span></button>
             <button class="workspace-tab" type="button" data-panel="taxonomy-panel">Taxonomies <span id="taxonomy-tab-count"></span></button>
             <button class="workspace-tab" type="button" data-panel="coverage-panel">Source coverage</button>
           </nav>
@@ -123,6 +133,7 @@
               <label><span>Subtype</span><select id="subtype-filter"><option value="">All subtypes</option></select></label>
               <label class="file-type-filter"><span>File type</span><select id="file-type-filter"><option value="">All file types</option></select></label>
               <label><span>Review</span><select id="decision-filter"><option value="">All decisions</option></select></label>
+              <label class="live-filter"{% if not rest_enabled %} hidden{% endif %}><span>Live WordPress</span><select id="live-filter"><option value="">All live states</option></select></label>
               <label><span>Sort</span><select id="sort-select"><option value="priority">Finding priority</option><option value="modified-desc">Recently modified</option><option value="modified-asc">Oldest modified</option><option value="title">Title</option><option value="author">Author</option></select></label>
             </div>
 
@@ -132,11 +143,20 @@
 
             <div class="table-toolbar">
               <p id="result-count" aria-live="polite">Loading content…</p>
-              <label><span>Rows</span><select id="page-size"><option>25</option><option selected>50</option><option>100</option><option>200</option></select></label>
+              <div class="table-toolbar-actions">
+                {% if rest_write_enabled %}
+                  <span id="selection-count" class="selection-count">0 selected</span>
+                  <button class="button button-danger button-compact" id="bulk-trash" type="button" disabled>Move to Trash in WordPress</button>
+                {% endif %}
+                <label><span>Rows</span><select id="page-size"><option>25</option><option selected>50</option><option>100</option><option>200</option></select></label>
+              </div>
             </div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Finding</th><th>Content</th><th>Author</th><th>Taxonomies</th><th>Published</th><th>Last updated</th><th>Review</th><th><span class="sr-only">Details</span></th></tr></thead>
+                <thead><tr>
+                  {% if rest_write_enabled %}<th class="select-col"><label class="sr-only" for="select-page">Select page</label><input id="select-page" type="checkbox"></th>{% endif %}
+                  <th>Finding</th><th>Live</th><th>Content</th><th>Author</th><th>Taxonomies</th><th>Published</th><th>Last updated</th><th>Review</th><th><span class="sr-only">Details</span></th>
+                </tr></thead>
                 <tbody id="results-body"></tbody>
               </table>
               <div class="empty-state" id="empty-state" hidden><strong>No records match this view.</strong><span>Clear a filter or choose another content group.</span></div>
@@ -156,6 +176,11 @@
               {% for source in report['source_coverage'] %}
                 <article class="coverage-row"><span class="coverage-status {{ 'is-available' if source['available'] else 'is-missing' }}" aria-hidden="true">{{ '✓' if source['available'] else '—' }}</span><div><strong>{{ source['source'] }}</strong><p>{{ source['detail'] }}</p></div><span class="coverage-label">{{ 'Included' if source['available'] else 'Unavailable' }}</span></article>
               {% endfor %}
+              {% if rest_write_enabled %}
+                <article class="coverage-row"><span class="coverage-status is-available" aria-hidden="true">✓</span><div><strong>WordPress REST (local, Trash enabled)</strong><p>Optional live exists/status check and confirmed Move to Trash. Permanent delete is never sent. This is not available on Vercel.</p></div><span class="coverage-label">Configured</span></article>
+              {% elif rest_enabled %}
+                <article class="coverage-row"><span class="coverage-status is-available" aria-hidden="true">✓</span><div><strong>WordPress REST (local, read-only)</strong><p>Optional live exists/status check using an Application Password. Nothing is written to WordPress.</p></div><span class="coverage-label">Configured</span></article>
+              {% endif %}
             </div>
           </section>
         </section>
@@ -179,7 +204,7 @@
     <div id="detail-content"></div>
   </dialog>
 
-  <script id="runtime-data" type="application/json">{{ {'chunk_size': chunk_size, 'storage_mode': storage_mode}|tojson }}</script>
+  <script id="runtime-data" type="application/json">{{ {'chunk_size': chunk_size, 'storage_mode': storage_mode, 'rest_enabled': rest_enabled, 'rest_write_enabled': rest_write_enabled}|tojson }}</script>
   <div class="loading" id="loading" hidden role="status"><div class="spinner" aria-hidden="true"></div><strong id="loading-label">Preparing the WordPress export</strong><span id="loading-detail">Building the inventory, taxonomies, and reference graph…</span><progress id="upload-progress" max="100" value="0"></progress></div>
 </body>
 </html>

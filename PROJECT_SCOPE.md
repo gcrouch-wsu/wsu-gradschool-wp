@@ -4,7 +4,7 @@
 
 Build a local, evidence-based review tool that analyzes a WordPress WXR export and helps Graduate School site maintainers identify pages, posts, documents, media, and plugin content that may no longer be needed.
 
-The application supports human decisions; it does not modify WordPress or automatically label anything safe to delete. Its central question is: **What evidence connects this record to the rest of the site, and what evidence is missing?**
+The application supports human decisions and, locally, confirmed WordPress Trash. It does not automatically label anything safe to delete, and it never force-deletes. Its central question is: **What evidence connects this record to the rest of the site, and what evidence is missing?**
 
 For local development, the latest analysis and review decisions live only in process memory. On Vercel, the same workflow uses private Blob-backed audit sessions so requests can move between function instances. Raw XML chunks are removed after analysis, and an audit can be explicitly removed from the interface.
 
@@ -77,9 +77,9 @@ The intended workflow is:
 2. Filter by finding, status, author, subtype, taxonomy term, or search text.
 3. Open record details and inspect metadata plus where-used evidence.
 4. Assign an in-memory review decision: Keep, Expected Development, Verify, Deletion Candidate, or Approved to Delete.
-5. Export the current filtered view to CSV or JSON for review or action outside this application.
+5. Export the current filtered view to CSV or JSON, or use the work queue to review unreferenced records, live-missing records, and deletion candidates.
 
-The application never performs the deletion. A future persistent release should also require an explicit verification checkpoint before a record can receive an approved-to-delete decision.
+Locally, with `WP_REST_WRITE_ENABLED=1`, the app can move selected records to WordPress Trash after an explicit confirmation. It never force-deletes. Restore remains a WordPress admin action.
 
 ## What a WXR export can and cannot prove
 
@@ -91,8 +91,8 @@ Consequently, “unreferenced in export” means exactly that. It is not equival
 
 ## Safety and privacy requirements
 
-- Remain read-only with respect to WordPress.
-- Never delete or mutate site content.
+- Stay local-only for WordPress REST credentials and writes. Never put `WP_REST_*` on Vercel.
+- Trash is opt-in (`WP_REST_WRITE_ENABLED`), confirmed in the UI, and never uses WordPress `force` delete.
 - Keep uploaded data and review decisions local and in memory for the current phase.
 - Parse XML with protections appropriate for untrusted uploads.
 - Preserve original evidence while normalizing URLs for matching.
