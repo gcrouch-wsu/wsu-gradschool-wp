@@ -112,7 +112,7 @@
   if (!groups.length) return;
   const controls = {
     search: qs("#search-filter"), classification: qs("#classification-filter"), status: qs("#status-filter"),
-    author: qs("#author-filter"), subtype: qs("#subtype-filter"), decision: qs("#decision-filter"),
+    author: qs("#author-filter"), subtype: qs("#subtype-filter"), fileType: qs("#file-type-filter"), decision: qs("#decision-filter"),
     sort: qs("#sort-select"), pageSize: qs("#page-size"),
   };
   const state = { group: groups[0].id, page: 1, taxonomy: "", term: "", requestNumber: 0 };
@@ -123,7 +123,7 @@
     const params = new URLSearchParams({ group: state.group });
     if (includePage) { params.set("page", state.page); params.set("page_size", controls.pageSize.value); }
     const values = { q: controls.search.value.trim(), classification: controls.classification.value,
-      status: controls.status.value, author: controls.author.value, subtype: controls.subtype.value,
+      status: controls.status.value, author: controls.author.value, subtype: controls.subtype.value, file_type: controls.fileType.value,
       decision: controls.decision.value, sort: controls.sort.value, taxonomy: state.taxonomy, term: state.term };
     Object.entries(values).forEach(([key, value]) => { if (value) params.set(key, value); });
     return params;
@@ -134,6 +134,7 @@
     values.forEach((value) => { const option = el("option", "", formatter(value)); option.value = value; select.append(option); });
     if (values.includes(old)) select.value = old;
   }
+  const fileTypeLabel = (value) => value === "<none>" ? "Unknown / no extension" : value.replace(/^\./, "").toUpperCase();
   function summaryItem(label, value, note) {
     const card = el("div", "summary-item"); card.append(el("span", "", label), el("strong", "", Number(value).toLocaleString()));
     if (note) card.append(el("small", "", note)); return card;
@@ -211,6 +212,7 @@
       if (resetFacets) {
         setOptions(controls.classification, payload.facets.classifications, "All findings"); setOptions(controls.status, payload.facets.statuses, "All statuses");
         setOptions(controls.author, payload.facets.authors, "All authors", (value) => value); setOptions(controls.subtype, payload.facets.subtypes, "All subtypes");
+        setOptions(controls.fileType, payload.facets.file_types, "All file types", fileTypeLabel);
         setOptions(controls.decision, payload.facets.decisions, "All decisions");
       }
       renderRows(payload.items); qs("#result-count").textContent = `${payload.total.toLocaleString()} record${payload.total === 1 ? "" : "s"} in this view`;
@@ -232,7 +234,19 @@
       detailField(details, "Author", item.author_name || item.author_login || "Unknown"); detailField(details, "Author login", item.author_login); detailField(details, "Published", item.created);
       detailField(details, "Author email", item.author_email); detailField(details, "Last updated", item.modified); detailField(details, "Parent ID", item.parent_id === "0" ? "None" : item.parent_id);
       detailField(details, "Inbound evidence", `${item.inbound_strong} strong · ${item.inbound_possible} possible · ${item.inbound_structural} structural`); detailField(details, "Outbound references", String(item.outbound));
-      if (item.group === "media") { detailField(details, "File", item.file_name); detailField(details, "MIME type", item.mime_type); detailField(details, "File size", formatBytes(item.file_size));
+      if (item.group === "media" || item.group === "documents") {
+        const previewUrl = safeLink(item.url), extension = (item.file_extension || "").toLowerCase();
+        const isImage = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"].includes(extension);
+        if (previewUrl) {
+          const preview = el("section", "media-review");
+          const previewPane = el("div", "media-preview");
+          if (isImage) { const image = document.createElement("img"); image.src = previewUrl; image.alt = item.alt_text || item.title || "Media preview"; image.loading = "lazy"; image.referrerPolicy = "no-referrer"; image.addEventListener("error", () => { previewPane.replaceChildren(el("p", "muted", "Preview unavailable. The exported URL may be private or no longer reachable.")); }); previewPane.append(image); }
+          else previewPane.append(el("div", "file-preview-icon", fileTypeLabel(item.file_extension || "<none>")));
+          const previewInfo = el("div", "media-preview-info"); previewInfo.append(el("strong", "", isImage ? "Image preview" : "File preview"), el("span", "muted", isImage ? "Loaded from the exported attachment URL." : "Binary file is not included in the WXR export."));
+          if (previewUrl) { const link = el("a", "detail-link", "Open original"); link.href = previewUrl; link.target = "_blank"; link.rel = "noopener noreferrer"; previewInfo.append(link); }
+          preview.append(previewPane, previewInfo); content.append(preview);
+        }
+        detailField(details, "File", item.file_name || item.url); detailField(details, "File type", fileTypeLabel(item.file_extension || "<none>")); detailField(details, "MIME type", item.mime_type || "Not exported"); detailField(details, "File size", formatBytes(item.file_size));
         detailField(details, "Dimensions", item.width && item.height ? `${item.width} × ${item.height} px` : "Not exported"); detailField(details, "ALT text", item.alt_text || "Not set");
         detailField(details, "Caption", item.caption || "Not set"); detailField(details, "Description", item.description || "Not set");
         detailField(details, "Generated variants", String(item.derivative_count || 0)); detailField(details, "Stored path", item.stored_path || "Not exported"); }
@@ -268,7 +282,7 @@
   }
   function chooseGroup(groupId) {
     state.group = groupId; state.page = 1; state.taxonomy = ""; state.term = ""; controls.search.value = "";
-    [controls.classification, controls.status, controls.author, controls.subtype, controls.decision].forEach((control) => { control.value = ""; });
+    [controls.classification, controls.status, controls.author, controls.subtype, controls.fileType, controls.decision].forEach((control) => { control.value = ""; });
     qs("#active-taxonomy-filter").hidden = true; qsa(".group-card").forEach((card) => card.classList.toggle("is-active", card.dataset.group === groupId));
     renderGroupHeader(); loadItems(true); loadTaxonomies();
   }
@@ -285,7 +299,7 @@
   qs("#clear-taxonomy-filter").addEventListener("click", () => { state.taxonomy = ""; state.term = ""; state.page = 1; qs("#active-taxonomy-filter").hidden = true; loadItems(); });
   qs("#previous-page").addEventListener("click", () => { state.page -= 1; loadItems(); }); qs("#next-page").addEventListener("click", () => { state.page += 1; loadItems(); });
   controls.search.addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { state.page = 1; loadItems(); }, 250); });
-  [controls.classification, controls.status, controls.author, controls.subtype, controls.decision, controls.sort, controls.pageSize].forEach((control) => control.addEventListener("change", () => { state.page = 1; loadItems(); }));
+  [controls.classification, controls.status, controls.author, controls.subtype, controls.fileType, controls.decision, controls.sort, controls.pageSize].forEach((control) => control.addEventListener("change", () => { state.page = 1; loadItems(); }));
   qs("#close-dialog").addEventListener("click", () => qs("#detail-dialog").close()); qs("#detail-dialog").addEventListener("click", (event) => { if (event.target === qs("#detail-dialog")) qs("#detail-dialog").close(); });
   renderGroupHeader(); loadItems(true); loadTaxonomies();
 })();

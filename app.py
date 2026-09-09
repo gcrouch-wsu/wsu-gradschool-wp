@@ -98,6 +98,7 @@ def create_app() -> Flask:
         status = request.args.get("status", "")
         author = request.args.get("author", "")
         subtype = request.args.get("subtype", "")
+        file_type = request.args.get("file_type", "")
         taxonomy = request.args.get("taxonomy", "")
         term = request.args.get("term", "")
         decision = request.args.get("decision", "")
@@ -116,6 +117,8 @@ def create_app() -> Flask:
             if author and (row["author_name"] or row["author_login"] or "Unknown") != author:
                 continue
             if subtype and row["content_class"] != subtype:
+                continue
+            if file_type and (row.get("file_extension") or "<none>").lower() != file_type:
                 continue
             if taxonomy and taxonomy not in row["taxonomy_terms"]:
                 continue
@@ -307,6 +310,7 @@ def create_app() -> Flask:
             "statuses": sorted({row["status"] or "unknown" for row in all_group_rows}),
             "classifications": sorted({row["classification"] for row in all_group_rows}),
             "subtypes": sorted({row["content_class"] for row in all_group_rows}),
+            "file_types": sorted({(row.get("file_extension") or "<none>").lower() for row in all_group_rows}),
             "decisions": sorted(REVIEW_DECISIONS),
         }
         return jsonify(
