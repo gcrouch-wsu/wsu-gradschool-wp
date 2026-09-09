@@ -1,0 +1,24 @@
+# WordPress exports can contain unpublished content and personal information.
+*.xml
+!tests/fixtures/*.xml
+exports/
+reports/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local configuration and platform metadata
+.env
+.env.*
+!.env.example
+.vercel/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

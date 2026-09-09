@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Evidence-based WordPress content and media audit.">
+  <title>{% if report %}{{ report['site']['title'] }} Audit{% else %}WordPress Content Audit{% endif %} | WSU Graduate School</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</head>
+<body class="{% if report %}has-report{% endif %}">
+  <header class="site-header">
+    <div class="shell masthead">
+      <a class="wordmark" href="/" aria-label="WordPress Content Audit home">
+        <span class="wordmark-wsu">Washington State University</span>
+        <span class="wordmark-product">Graduate School · Content Audit</span>
+      </a>
+      <div class="header-meta">
+        <span class="privacy-chip"><i aria-hidden="true"></i>{{ 'Private audit storage' if storage_mode == 'blob' else 'Local and read-only' }}</span>
+        {% if report %}<button class="button button-ghost" id="new-analysis" type="button">New export</button>{% endif %}
+      </div>
+    </div>
+  </header>
+
+  <main>
+    {% if not report %}
+      <section class="landing shell">
+        <div class="landing-copy">
+          <p class="eyebrow">WordPress content governance</p>
+          <h1>Understand what exists.<br>Decide what stays.</h1>
+          <p>Turn a WordPress site export into a structured inventory of pages, posts, events, media, documents, tables, forms, and their relationships.</p>
+          <ul class="assurance-list">
+            <li>Nothing is written to WordPress</li>
+            <li>Every finding retains its evidence</li>
+            {% if storage_mode == 'blob' %}
+              <li>Raw XML chunks are removed after analysis</li>
+              <li>Reports use private audit storage</li>
+            {% else %}
+              <li>Uploaded data remains in memory</li>
+            {% endif %}
+          </ul>
+        </div>
+        <section class="upload-panel" aria-labelledby="upload-heading">
+          <p class="step">Start an audit</p>
+          <h2 id="upload-heading">Select a site export</h2>
+          <p>In WordPress, choose Tools → Export → All content, then upload the resulting XML file.</p>
+          {% if error %}
+            <div class="alert alert-error" role="alert"><strong>Analysis stopped</strong><span>{{ error }}</span></div>
+          {% endif %}
+          <form class="upload-form" method="post" enctype="multipart/form-data">
+            <label class="file-drop" for="file-input">
+              <span class="file-icon" aria-hidden="true">XML</span>
+              <span><strong id="file-label">Choose or drop an XML export</strong><small>Maximum file size: 250 MB</small></span>
+              <input id="file-input" name="export_file" type="file" accept=".xml,text/xml,application/xml" required>
+            </label>
+            <button class="button button-primary" type="submit">Analyze export <span aria-hidden="true">→</span></button>
+          </form>
+        </section>
+      </section>
+    {% else %}
+      <section class="report-shell shell">
+        <div class="report-titlebar">
+          <div>
+            <p class="eyebrow">Site content inventory</p>
+            <h1>{{ report['site']['title'] or 'WordPress export' }}</h1>
+            <p class="report-provenance">{{ filename }} <span>·</span> {{ report['stats']['exported_items']|int }} exported records <span>·</span> analyzed in {{ report['analysis_seconds'] }} seconds</p>
+          </div>
+          <div class="title-actions">
+            {% if report['site']['site_url'] %}<a class="button button-outline" href="{{ report['site']['site_url'] }}" target="_blank" rel="noopener noreferrer">Open site ↗</a>{% endif %}
+            <button class="button button-outline" id="coverage-shortcut" type="button">Source coverage</button>
+          </div>
+        </div>
+
+        {% if error %}<div class="alert alert-error" role="alert"><strong>Analysis stopped</strong><span>{{ error }}</span></div>{% endif %}
+
+        <section class="group-section" aria-labelledby="groups-heading">
+          <div class="section-heading">
+            <div><p class="step">Content groups</p><h2 id="groups-heading">WordPress inventory</h2></div>
+            <p>Select a group to inspect its records, taxonomy assignments, and audit findings.</p>
+          </div>
+          <div class="group-grid" id="group-grid">
+            {% for group in report['groups'] %}
+              <button class="group-card{% if loop.first %} is-active{% endif %}" type="button" data-group="{{ group['id'] }}">
+                <span class="group-card-head">
+                  <span class="group-label">{{ group['label'] }}</span>
+                  {% if group['incomplete'] %}<span class="data-chip">Partial data</span>{% endif %}
+                </span>
+                <strong>{{ "{:,}".format(group['count']) }}</strong>
+                <span class="group-description">{{ group['description'] }}</span>
+                <span class="group-card-foot"><b>{{ group['public'] }}</b> public <i></i> <b>{{ group['review_candidates'] }}</b> review</span>
+              </button>
+            {% endfor %}
+          </div>
+        </section>
+
+        <section class="audit-workspace">
+          <header class="workspace-header">
+            <div>
+              <p class="step" id="active-group-kicker">Selected group</p>
+              <h2 id="active-group-title">Content</h2>
+              <p id="active-group-description"></p>
+            </div>
+            <div class="workspace-actions">
+              <a class="button button-outline" id="export-csv" href="/api/export.csv">Export CSV</a>
+              <a class="button button-outline" id="export-json" href="/api/export.json">Export JSON</a>
+            </div>
+          </header>
+
+          <div class="summary-strip" id="summary-strip" aria-label="Selected group summary"></div>
+
+          <nav class="workspace-tabs" aria-label="Audit views">
+            <button class="workspace-tab is-active" type="button" data-panel="content-panel">Content</button>
+            <button class="workspace-tab" type="button" data-panel="taxonomy-panel">Taxonomies <span id="taxonomy-tab-count"></span></button>
+            <button class="workspace-tab" type="button" data-panel="coverage-panel">Source coverage</button>
+          </nav>
+
+          <section class="workspace-panel is-active" id="content-panel">
+            <div class="filters" aria-label="Content filters">
+              <label class="search-field"><span>Search this group</span><input id="search-filter" type="search" placeholder="Title, URL, ID, or filename"></label>
+              <label><span>Finding</span><select id="classification-filter"><option value="">All findings</option></select></label>
+              <label><span>Status</span><select id="status-filter"><option value="">All statuses</option></select></label>
+              <label><span>Author</span><select id="author-filter"><option value="">All authors</option></select></label>
+              <label><span>Subtype</span><select id="subtype-filter"><option value="">All subtypes</option></select></label>
+              <label><span>Review</span><select id="decision-filter"><option value="">All decisions</option></select></label>
+              <label><span>Sort</span><select id="sort-select"><option value="priority">Finding priority</option><option value="modified-desc">Recently modified</option><option value="modified-asc">Oldest modified</option><option value="title">Title</option><option value="author">Author</option></select></label>
+            </div>
+
+            <div class="active-taxonomy-filter" id="active-taxonomy-filter" hidden>
+              <span id="active-taxonomy-text"></span><button type="button" id="clear-taxonomy-filter">Clear</button>
+            </div>
+
+            <div class="table-toolbar">
+              <p id="result-count" aria-live="polite">Loading content…</p>
+              <label><span>Rows</span><select id="page-size"><option>25</option><option selected>50</option><option>100</option><option>200</option></select></label>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Finding</th><th>Content</th><th>Author</th><th>Taxonomies</th><th>Published</th><th>Last updated</th><th>Review</th><th><span class="sr-only">Details</span></th></tr></thead>
+                <tbody id="results-body"></tbody>
+              </table>
+              <div class="empty-state" id="empty-state" hidden><strong>No records match this view.</strong><span>Clear a filter or choose another content group.</span></div>
+            </div>
+            <div class="pagination"><button class="button button-outline" id="previous-page" type="button">Previous</button><span id="page-status"></span><button class="button button-outline" id="next-page" type="button">Next</button></div>
+          </section>
+
+          <section class="workspace-panel" id="taxonomy-panel" hidden>
+            <div class="panel-intro"><div><h3>Taxonomy explorer</h3><p>Choose a taxonomy term to see the matching records in this content group.</p></div></div>
+            <div class="taxonomy-grid" id="taxonomy-grid"></div>
+            <div class="empty-state" id="taxonomy-empty" hidden><strong>No taxonomies are assigned to this group.</strong><span>The export contains no taxonomy relationships for these records.</span></div>
+          </section>
+
+          <section class="workspace-panel" id="coverage-panel" hidden>
+            <div class="panel-intro"><div><h3>Analysis source coverage</h3><p>This explains what the export can prove and where a live or plugin-specific check is still required.</p></div></div>
+            <div class="coverage-list">
+              {% for source in report['source_coverage'] %}
+                <article class="coverage-row"><span class="coverage-status {{ 'is-available' if source['available'] else 'is-missing' }}" aria-hidden="true">{{ '✓' if source['available'] else '—' }}</span><div><strong>{{ source['source'] }}</strong><p>{{ source['detail'] }}</p></div><span class="coverage-label">{{ 'Included' if source['available'] else 'Unavailable' }}</span></article>
+              {% endfor %}
+            </div>
+          </section>
+        </section>
+
+        <details class="replace-export" id="replace-export">
+          <summary>Analyze a different export</summary>
+          <form class="upload-form compact" method="post" enctype="multipart/form-data">
+            <label class="file-drop" for="replacement-file"><span class="file-icon" aria-hidden="true">XML</span><span><strong id="replacement-label">Choose another XML export</strong><small>It will replace the current in-memory report.</small></span><input id="replacement-file" name="export_file" type="file" accept=".xml,text/xml,application/xml" required></label>
+            <button class="button button-primary" type="submit">Analyze replacement</button>
+          </form>
+          <button class="button button-danger" id="delete-audit" type="button">Remove this stored audit</button>
+        </details>
+      </section>
+
+      <script id="dashboard-data" type="application/json">{{ {'groups': report['groups'], 'site': report['site'], 'taxonomy_labels': report['taxonomy_labels']}|tojson }}</script>
+    {% endif %}
+  </main>
+
+  <dialog id="detail-dialog" aria-labelledby="detail-title">
+    <header class="dialog-header"><div><p class="step" id="detail-kicker">Content evidence</p><h2 id="detail-title">Record detail</h2></div><button class="icon-button" id="close-dialog" type="button" aria-label="Close details">×</button></header>
+    <div id="detail-content"></div>
+  </dialog>
+
+  <script id="runtime-data" type="application/json">{{ {'chunk_size': chunk_size, 'storage_mode': storage_mode}|tojson }}</script>
+  <div class="loading" id="loading" hidden role="status"><div class="spinner" aria-hidden="true"></div><strong id="loading-label">Preparing the WordPress export</strong><span id="loading-detail">Building the inventory, taxonomies, and reference graph…</span><progress id="upload-progress" max="100" value="0"></progress></div>
+</body>
+</html>
