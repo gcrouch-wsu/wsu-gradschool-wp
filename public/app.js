@@ -219,7 +219,7 @@
     const payload = await responseJson(await fetch("/api/trash", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ids, confirm: "trash" }),
+      body: JSON.stringify({ ids, confirm: "trash", csrf: runtime.write_csrf || "" }),
     }));
     payload.results.filter((result) => result.ok).forEach((result) => selected.delete(result.id));
     const failed = payload.results.filter((result) => !result.ok);
@@ -270,8 +270,10 @@
         author = document.createElement("td"), taxonomy = document.createElement("td"), published = document.createElement("td"),
         updated = document.createElement("td"), review = document.createElement("td"), actions = document.createElement("td");
       finding.append(badge(item.classification), meta(`${humanize(item.confidence)} confidence`));
+      if (item.expected_development) finding.append(badge("expected-development"));
       live.append(el("span", `badge badge-live-${item.live_state || "unchecked"}`, humanize(item.live_state || "unchecked")));
       if (item.live_status) live.append(meta(humanize(item.live_status)));
+      if (item.live_checked_at) live.append(meta(`Checked ${item.live_checked_at}`));
       const title = el("button", "content-title", item.title || item.file_name || "Untitled"); title.type = "button"; title.addEventListener("click", () => openDetails(item.id));
       content.append(title, meta(`${humanize(item.content_class)} · ${humanize(item.status)} · ID ${item.id}`));
       if (item.group === "media") content.append(meta(`${item.mime_type || "Unknown format"} · ${formatBytes(item.file_size)}${item.width && item.height ? ` · ${item.width} × ${item.height}` : ""}`));
@@ -327,6 +329,7 @@
       qs("#detail-title").textContent = item.title || item.file_name || "Untitled"; qs("#detail-kicker").textContent = `${item.group_label} · WordPress ID ${item.id}`;
       const content = qs("#detail-content"); content.replaceChildren(); const finding = el("section", "detail-finding"), findingText = el("div");
       findingText.append(el("strong", "", item.recommendation), el("p", "", item.reasons.join(" "))); finding.append(badge(item.classification), findingText); content.append(finding);
+      if (item.expected_development) finding.append(badge("expected-development"));
       const actionsBar = el("div", "detail-actions");
       const adminHref = safeLink(item.wp_admin_url);
       if (adminHref) {
@@ -353,6 +356,7 @@
       if (actionsBar.childNodes.length) content.append(actionsBar);
       const details = el("dl", "detail-grid"); detailField(details, "Content type", `${item.group_label} · ${humanize(item.content_class)}`); detailField(details, "Status", humanize(item.status));
       detailField(details, "Live WordPress", item.live_state ? `${humanize(item.live_state)}${item.live_status ? ` · ${humanize(item.live_status)}` : ""}` : "Not checked");
+      detailField(details, "Live check time", item.live_checked_at || "Not checked");
       detailField(details, "Author", item.author_name || item.author_login || "Unknown"); detailField(details, "Author login", item.author_login); detailField(details, "Published", item.created);
       detailField(details, "Author email", item.author_email); detailField(details, "Last updated", item.modified); detailField(details, "Parent ID", item.parent_id === "0" ? "None" : item.parent_id);
       detailField(details, "Inbound evidence", `${item.inbound_strong} strong · ${item.inbound_possible} possible · ${item.inbound_structural} structural`); detailField(details, "Outbound references", String(item.outbound));
@@ -396,7 +400,7 @@
         const card = el("article", "taxonomy-card"), head = el("header", "taxonomy-card-head"), title = el("div"), stats = el("div", "taxonomy-stats"), terms = el("div", "term-cloud");
         title.append(el("h3", "", taxonomy.label), el("code", "taxonomy-key", taxonomy.key)); stats.append(el("span", "", `${taxonomy.unique_terms.toLocaleString()} terms`), el("span", "", `${taxonomy.records_tagged.toLocaleString()} records`), el("span", "", `${taxonomy.assignments.toLocaleString()} assignments`)); head.append(title, stats);
         taxonomy.terms.forEach((term) => { const button = el("button", "term-button"); button.type = "button"; button.append(el("span", "", term.name), el("b", "", term.count.toLocaleString()));
-          button.addEventListener("click", () => { state.taxonomy = taxonomy.key; state.term = term.name; state.page = 1; qs("#active-taxonomy-text").textContent = `${taxonomy.label}: ${term.name}`;
+          button.addEventListener("click", () => { state.taxonomy = taxonomy.key; state.term = term.slug || term.name; state.page = 1; qs("#active-taxonomy-text").textContent = `${taxonomy.label}: ${term.name}`;
             qs("#active-taxonomy-filter").hidden = false; showPanel("content-panel"); loadItems(); }); terms.append(button); });
         card.append(head, terms); grid.append(card);
       });

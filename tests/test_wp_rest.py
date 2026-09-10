@@ -1,7 +1,7 @@
 import pytest
 
-from analyzer.ids import rest_base_url_allowed, sites_are_same, wordpress_id
-from analyzer.url_normalizer import public_href
+from analyzer.ids import rest_base_url_allowed, same_http_origin, sites_are_same, wordpress_id
+from analyzer.url_normalizer import normalize_url, public_href
 from analyzer.wp_rest import WordPressRestClient, live_check_items, trash_items, wp_admin_edit_url
 
 
@@ -25,6 +25,16 @@ def test_list_type_follows_total_pages_header():
     assert status == 200
     assert {record["id"] for record in payload} == {1, 2}
     assert any("&page=2" in url or url.endswith("page=2") for url in seen)
+
+
+def test_list_type_rejects_unrelated_include_records():
+    def fake_get(url, headers, timeout):
+        return 200, [{"id": 99, "status": "publish", "type": "page"}]
+
+    client = WordPressRestClient("https://example.test", "gcrouch", "secret", http_get=fake_get)
+    status, payload = client.list_type("pages", ["1"])
+    assert status == 502
+    assert "include list" in payload["message"]
 
 
 def test_list_type_rejects_non_list_payload():
@@ -128,11 +138,33 @@ def test_wordpress_ids_reject_query_injection():
     assert rest_base_url_allowed("http://127.0.0.1")
     assert sites_are_same(["https://gradschool.wsu.edu"], "https://www.gradschool.wsu.edu")
     assert not sites_are_same(["https://example.test"], "https://gradschool.wsu.edu")
+    assert not sites_are_same(["https://gradschool.wsu.edu:8443"], "https://gradschool.wsu.edu")
+    assert not sites_are_same(["https://example.test/site-a"], "https://example.test/site-b")
+    assert sites_are_same(["https://example.test/site-a"], "https://example.test/site-a/")
+    assert not sites_are_same(["http://example.test"], "https://example.test")
+    assert same_http_origin("https://example.test/wp-json/wp/v2/pages/1", "https://example.test/wp-json/wp/v2/pages/2")
+    assert not same_http_origin("https://example.test/wp-json/wp/v2/pages/1", "https://evil.test/wp-json/wp/v2/pages/1")
+    assert normalize_url("https://example.test:notaport/path") == ""
 
 
 def test_client_rejects_plaintext_remote_rest():
     with pytest.raises(ValueError):
         WordPressRestClient("http://gradschool.wsu.edu", "gcrouch", "secret")
+
+
+def test_trash_rejects_mismatched_delete_identity():
+    def fake_get(url, headers, timeout):
+        return 200, {"id": 3, "status": "publish", "type": "page", "title": {"rendered": "Development page"}}
+
+    def fake_delete(url, headers, timeout):
+        return 200, {"id": 99, "status": "trash", "type": "page"}
+
+    client = WordPressRestClient(
+        "https://example.test", "gcrouch", "secret", http_get=fake_get, http_delete=fake_delete
+    )
+    results = trash_items([{"id": "3", "type": "page", "title": "Development page"}], client)
+    assert results[0]["ok"] is False
+    assert "identity" in results[0]["error"]
 
 
 def test_trash_uses_delete_without_force():
@@ -215,3 +247,19 @@ def test_trash_refuses_media_when_wordpress_requires_force_delete():
     results = trash_items([{"id": "4", "type": "attachment", "title": "Photo"}], client)
     assert results[0]["ok"] is False
     assert "will not permanently delete" in results[0]["error"]
+
+
+def test_trash_reports_remaining_items_when_wordpress_refuses_auth():
+    def fake_get(url, headers, timeout):
+        return 401, {"message": "rest_forbidden"}
+
+    client = WordPressRestClient("https://example.test", "gcrouch", "secret", http_get=fake_get)
+    results = trash_items(
+        [
+            {"id": "3", "type": "page", "title": "Development page"},
+            {"id": "1", "type": "page", "title": "Landing page"},
+        ],
+        client,
+    )
+    assert len(results) == 2
+    assert all(not result["ok"] for result in results)

@@ -15,9 +15,9 @@ from flask import Flask, Response, jsonify, render_template, request, session
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from analyzer import analyze_export, parse_wxr
-from analyzer.ids import LOOPBACK_HOSTS, sites_are_same, wordpress_id
+from analyzer.ids import LOOPBACK_HOSTS, is_loopback_address, sites_are_same, wordpress_id
 from analyzer.wp_rest import MAX_TRASH_BATCH, client_from_env, live_check_items, rest_base_for, trash_items
-from audit_store import AuditStore
+from audit_store import AuditStore, RevisionConflict
 from local_env import load_local_env, rest_enabled, rest_write_enabled
 
 
@@ -31,17 +31,18 @@ FINDING_PRIORITY = {
     "unreferenced-media": 1,
     "disconnected": 2,
     "needs-verification": 3,
-    "expected-development": 4,
-    "non-public": 5,
-    "linked": 6,
+    "non-public": 4,
+    "linked": 5,
 }
 QUEUE_FINDINGS = {"unreferenced", "unreferenced-media", "disconnected"}
 QUEUE_LIVE_STATES = {"missing", "trashed"}
 
 
 def _expected_author_aliases() -> set[str]:
-    configured = os.environ.get("WP_EXPECTED_DEVELOPMENT_AUTHORS", "greg crouch,gcrouch")
-    return {alias.strip() for alias in configured.split(",") if alias.strip()}
+    if "WP_EXPECTED_DEVELOPMENT_AUTHORS" in os.environ:
+        configured = os.environ.get("WP_EXPECTED_DEVELOPMENT_AUTHORS", "")
+        return {alias.strip() for alias in configured.split(",") if alias.strip()}
+    return {"greg crouch", "gcrouch"}
 
 
 def _integer_arg(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -58,7 +59,7 @@ def _spreadsheet_safe(value) -> str:
         text = ""
     else:
         text = str(value)
-    return f"'{text}" if text.startswith(("=", "+", "-", "@", "\t", "\r")) else text
+    return f"'{text}" if text.startswith(("=", "+", "-", "@", "\t", "\r", "\n")) else text
 
 
 def create_app() -> Flask:
@@ -89,20 +90,39 @@ def create_app() -> Flask:
         )
         return response
 
+    def write_csrf_token() -> str:
+        token = session.get("write_csrf")
+        if not token:
+            token = secrets.token_hex(32)
+            session["write_csrf"] = token
+        return token
+
+    @app.before_request
+    def ensure_write_csrf():
+        write_csrf_token()
+
     def write_request_allowed() -> bool:
-        if app.config.get("TESTING"):
-            return True
-        host = (request.host or "").split(":")[0].casefold()
-        if host not in LOOPBACK_HOSTS:
+        if not is_loopback_address(request.remote_addr or ""):
             return False
-        origin = request.headers.get("Origin") or request.headers.get("Referer") or ""
-        if not origin:
-            return True
-        try:
-            origin_host = (urlsplit(origin).hostname or "").casefold()
-        except ValueError:
-            return False
-        return not origin_host or origin_host in LOOPBACK_HOSTS
+        origin = request.headers.get("Origin")
+        if origin is not None:
+            if origin.strip().casefold() in {"", "null"}:
+                return False
+            try:
+                origin_host = (urlsplit(origin).hostname or "").casefold()
+            except ValueError:
+                return False
+            if origin_host and origin_host not in LOOPBACK_HOSTS:
+                return False
+        referer = request.headers.get("Referer")
+        if referer:
+            try:
+                referer_host = (urlsplit(referer).hostname or "").casefold()
+            except ValueError:
+                return False
+            if referer_host and referer_host not in LOOPBACK_HOSTS:
+                return False
+        return True
 
     def rest_available() -> bool:
         return rest_enabled(testing=bool(app.config.get("TESTING")))
@@ -114,6 +134,7 @@ def create_app() -> Flask:
         return {
             "rest_enabled": rest_available(),
             "rest_write_enabled": write_available(),
+            "write_csrf": write_csrf_token(),
         }
 
     def latest_state():
@@ -159,7 +180,10 @@ def create_app() -> Flask:
                 and row_decision not in {"candidate", "approved"}
             ):
                 continue
-            if classification and row["classification"] != classification:
+            if classification == "expected-development":
+                if not row.get("expected_development"):
+                    continue
+            elif classification and row["classification"] != classification:
                 continue
             if status and row["status"] != status:
                 continue
@@ -222,9 +246,11 @@ def create_app() -> Flask:
         payload["live_status"] = record.get("live_status") or ""
         payload["live_link"] = record.get("live_link") or ""
         payload["live_found"] = bool(record.get("live_found"))
+        payload["live_checked_at"] = record.get("checked_at") or ""
         payload["can_trash"] = bool(
             rest_base_for(row.get("type", ""))
-            and payload["live_state"] not in {"trashed", "not-in-rest"}
+            and payload["live_state"] == "found"
+            and payload["review_decision"] in {"candidate", "approved"}
         )
         if record.get("wp_admin_url"):
             payload["wp_admin_url"] = record["wp_admin_url"]
@@ -242,7 +268,8 @@ def create_app() -> Flask:
         exported["live_checked_at"] = record.get("checked_at") or ""
         exported["can_trash"] = bool(
             rest_base_for(row.get("type", ""))
-            and exported["live_state"] not in {"trashed", "not-in-rest"}
+            and exported["live_state"] == "found"
+            and exported["review_decision"] in {"candidate", "approved"}
         )
         if record.get("wp_admin_url"):
             exported["wp_admin_url"] = record["wp_admin_url"]
@@ -390,6 +417,12 @@ def create_app() -> Flask:
 
     @app.delete("/api/audit")
     def api_delete_audit():
+        pending = session.get("pending_upload") or {}
+        if pending.get("id"):
+            try:
+                audit_store.delete_chunks(pending["id"], pending.get("total_chunks", 0))
+            except Exception:
+                app.logger.exception("Pending upload chunks could not be removed")
         audit_store.delete_audit(session.get("audit_id"))
         session.clear()
         return jsonify({"ok": True})
@@ -413,7 +446,10 @@ def create_app() -> Flask:
         facets = {
             "authors": sorted({row["author_name"] or row["author_login"] or "Unknown" for row in all_group_rows}, key=str.casefold),
             "statuses": sorted({row["status"] or "unknown" for row in all_group_rows}),
-            "classifications": sorted({row["classification"] for row in all_group_rows}),
+            "classifications": sorted(
+                {row["classification"] for row in all_group_rows}
+                | ({"expected-development"} if any(row.get("expected_development") for row in all_group_rows) else set())
+            ),
             "subtypes": sorted({row["content_class"] for row in all_group_rows}),
             "file_types": sorted({(row.get("file_extension") or "<none>").lower() for row in all_group_rows}),
             "decisions": sorted(REVIEW_DECISIONS),
@@ -466,7 +502,12 @@ def create_app() -> Flask:
             state["decisions"].pop(item_id, None)
         else:
             state["decisions"][item_id] = decision
-        audit_store.save_decisions(session["audit_id"], state["decisions"])
+        try:
+            audit_store.save_decisions(
+                session["audit_id"], state["decisions"], expected_rev=state.get("decision_rev")
+            )
+        except RevisionConflict:
+            return jsonify({"error": "Another review update was saved first. Reload and try again."}), 409
         return jsonify({"id": item_id, "decision": decision})
 
     @app.post("/api/live-check")
@@ -478,12 +519,15 @@ def create_app() -> Flask:
             return jsonify({"error": "No export has been analyzed."}), 404
         data = request.get_json(silent=True) or {}
         group = str(data.get("group") or request.args.get("group") or "").strip()
+        site = state["report"].get("site") or {}
+        rest_url = os.environ.get("WP_REST_BASE_URL", "")
+        if not sites_are_same([site.get("site_url") or "", site.get("home_url") or ""], rest_url):
+            return jsonify({"error": "This export is not from the WordPress site configured for local REST."}), 409
         items = [
             row for row in state["report"]["items"]
             if not group or row["group"] == group
         ]
         try:
-            site = state["report"].get("site") or {}
             site_url = site.get("site_url") or site.get("home_url") or ""
             results = live_check_items(items, client_from_env(), site_url=site_url)
         except PermissionError as exc:
@@ -493,7 +537,10 @@ def create_app() -> Flask:
             return jsonify({"error": "The WordPress live check failed."}), 500
         live = dict(state["live"])
         live.update(results)
-        audit_store.save_live(session["audit_id"], live)
+        try:
+            audit_store.save_live(session["audit_id"], live, expected_rev=state.get("live_rev"))
+        except RevisionConflict:
+            return jsonify({"error": "Another live check was saved first. Reload and try again."}), 409
         counts = {
             "checked": len(results),
             "found": sum(item["live_state"] == "found" for item in results.values()),
@@ -514,6 +561,8 @@ def create_app() -> Flask:
         if not state:
             return jsonify({"error": "No export has been analyzed."}), 404
         data = request.get_json(silent=True) or {}
+        if str(data.get("csrf") or "") != session.get("write_csrf"):
+            return jsonify({"error": "Refresh the page and confirm Trash again."}), 403
         if str(data.get("confirm") or "") != "trash":
             return jsonify({"error": "Confirm moving these records to WordPress Trash."}), 400
         raw_ids = data.get("ids") or []
@@ -533,21 +582,27 @@ def create_app() -> Flask:
         missing = [item_id for item_id in ids if item_id not in by_id]
         if missing:
             return jsonify({"error": f"Unknown record ID: {missing[0]}."}), 404
-        already = [
-            item_id for item_id in ids
-            if (state["live"].get(item_id) or {}).get("live_state") == "trashed"
-        ]
-        if already:
-            return jsonify({"error": f"Record {already[0]} is already in WordPress Trash."}), 400
-        unsupported = [item_id for item_id in ids if not rest_base_for(by_id[item_id].get("type", ""))]
-        if unsupported:
-            return jsonify({"error": f"Record {unsupported[0]} cannot be trashed through WordPress REST."}), 400
-        items = [by_id[item_id] for item_id in ids]
         site = state["report"].get("site") or {}
         site_url = site.get("site_url") or site.get("home_url") or ""
         rest_url = os.environ.get("WP_REST_BASE_URL", "")
         if not sites_are_same([site.get("site_url") or "", site.get("home_url") or ""], rest_url):
             return jsonify({"error": "This export is not from the WordPress site configured for local REST writes."}), 409
+        not_ready = [
+            item_id for item_id in ids
+            if (state["live"].get(item_id) or {}).get("live_state") != "found"
+            or state["decisions"].get(item_id) not in {"candidate", "approved"}
+        ]
+        if not_ready:
+            return jsonify({
+                "error": (
+                    f"Record {not_ready[0]} must be live-checked as found and marked "
+                    "candidate or approved before Trash."
+                )
+            }), 400
+        unsupported = [item_id for item_id in ids if not rest_base_for(by_id[item_id].get("type", ""))]
+        if unsupported:
+            return jsonify({"error": f"Record {unsupported[0]} cannot be trashed through WordPress REST."}), 400
+        items = [by_id[item_id] for item_id in ids]
         try:
             results = trash_items(items, client_from_env(), site_url=site_url)
         except PermissionError as exc:
@@ -559,7 +614,18 @@ def create_app() -> Flask:
         for result in results:
             if result.get("ok") and result.get("live"):
                 live[result["id"]] = result["live"]
-        audit_store.save_live(session["audit_id"], live)
+        try:
+            audit_store.save_live(session["audit_id"], live, expected_rev=state.get("live_rev"))
+        except RevisionConflict:
+            latest = audit_store.load_state(session["audit_id"]) or state
+            merged = dict(latest.get("live") or {})
+            for result in results:
+                if result.get("ok") and result.get("live"):
+                    merged[result["id"]] = result["live"]
+            try:
+                audit_store.save_live(session["audit_id"], merged, expected_rev=latest.get("live_rev"))
+            except RevisionConflict:
+                app.logger.exception("Live overlay could not be saved after WordPress Trash")
         if not any(result["ok"] for result in results):
             return jsonify({
                 "error": results[0]["error"] if results else "Moving records to WordPress Trash failed.",

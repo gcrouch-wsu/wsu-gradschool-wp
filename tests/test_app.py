@@ -4,6 +4,11 @@ from app import create_app
 from tests.test_analyzer import WXR
 
 
+def _write_csrf(client):
+    with client.session_transaction() as sess:
+        return sess["write_csrf"]
+
+
 def _client_with_report():
     app = create_app()
     app.config.update(TESTING=True)
@@ -26,7 +31,9 @@ def test_paginated_group_api_and_lazy_detail():
     assert "/wp-admin/post.php?post=" in listing["items"][0]["wp_admin_url"]
     detail = client.get("/api/items/3").get_json()
     assert detail["author_name"] == "Greg Crouch"
+    assert detail["classification"] == "unreferenced"
     assert detail["underlying_classification"] == "unreferenced"
+    assert detail["expected_development"] is True
 
 
 def test_review_decision_and_filtered_export():
@@ -162,7 +169,18 @@ def test_confirmed_trash_updates_live_state(monkeypatch):
     deleted = []
 
     def fake_get(url, _headers, _timeout):
-        return 200, {"id": 3, "status": "publish", "type": "page"}
+        if "/pages?" in url:
+            return 200, [
+                {"id": 1, "status": "publish", "type": "page"},
+                {"id": 2, "status": "publish", "type": "page"},
+                {"id": 3, "status": "publish", "type": "page"},
+            ]
+        return 200, {
+            "id": 3,
+            "status": "publish",
+            "type": "page",
+            "title": {"rendered": "Development page"},
+        }
 
     def fake_delete(url, _headers, _timeout):
         deleted.append(url)
@@ -185,8 +203,15 @@ def test_confirmed_trash_updates_live_state(monkeypatch):
 
     client = _client_with_report()
     refused = client.post("/api/trash", json={"ids": ["3"]})
-    assert refused.status_code == 400
-    trashed = client.post("/api/trash", json={"ids": ["3"], "confirm": "trash"})
+    assert refused.status_code == 403
+    missing_confirm = client.post("/api/trash", json={"ids": ["3"], "csrf": _write_csrf(client)})
+    assert missing_confirm.status_code == 400
+    blocked = client.post("/api/trash", json={"ids": ["3"], "confirm": "trash", "csrf": _write_csrf(client)})
+    assert blocked.status_code == 400
+    assert "candidate or approved" in blocked.get_json()["error"]
+    assert client.post("/api/live-check", json={"group": "pages"}).status_code == 200
+    assert client.post("/api/items/3/decision", json={"decision": "approved"}).status_code == 200
+    trashed = client.post("/api/trash", json={"ids": ["3"], "confirm": "trash", "csrf": _write_csrf(client)})
     assert trashed.status_code == 200
     payload = trashed.get_json()
     assert payload["trashed"] == 1
@@ -196,7 +221,7 @@ def test_confirmed_trash_updates_live_state(monkeypatch):
     assert listing["total"] == 1
     assert listing["items"][0]["id"] == "3"
     assert listing["items"][0]["can_trash"] is False
-    hostile = client.post("/api/trash", json={"ids": ["3?force=true"], "confirm": "trash"})
+    hostile = client.post("/api/trash", json={"ids": ["3?force=true"], "confirm": "trash", "csrf": _write_csrf(client)})
     assert hostile.status_code == 400
 
 
@@ -213,6 +238,71 @@ def test_trash_refuses_export_from_a_different_site(monkeypatch):
     monkeypatch.setattr("analyzer.wp_rest._http_delete", fail_delete)
 
     client = _client_with_report()
-    response = client.post("/api/trash", json={"ids": ["3"], "confirm": "trash"})
+    response = client.post(
+        "/api/trash",
+        json={"ids": ["3"], "confirm": "trash", "csrf": _write_csrf(client)},
+    )
     assert response.status_code == 409
     assert "not from the WordPress site" in response.get_json()["error"]
+
+
+def test_trash_rejects_non_loopback_clients_and_null_origin(monkeypatch):
+    monkeypatch.setenv("WP_REST_ALLOW_IN_TESTS", "1")
+    monkeypatch.setenv("WP_REST_ENABLED", "1")
+    monkeypatch.setenv("WP_REST_WRITE_ENABLED", "1")
+    monkeypatch.setenv("WP_REST_BASE_URL", "https://example.test")
+    monkeypatch.setenv("WP_REST_USERNAME", "gcrouch")
+    monkeypatch.setenv("WP_REST_APPLICATION_PASSWORD", "not-a-real-password")
+
+    client = _client_with_report()
+    csrf = _write_csrf(client)
+    remote = client.post(
+        "/api/trash",
+        json={"ids": ["3"], "confirm": "trash", "csrf": csrf},
+        environ_base={"REMOTE_ADDR": "203.0.113.10"},
+    )
+    assert remote.status_code == 403
+    origin = client.post(
+        "/api/trash",
+        json={"ids": ["3"], "confirm": "trash", "csrf": csrf},
+        headers={"Origin": "null"},
+    )
+    assert origin.status_code == 403
+
+
+def test_delete_audit_removes_pending_upload_chunks():
+    app = create_app()
+    app.config.update(TESTING=True)
+    client = app.test_client()
+    store = app.extensions["audit_store"]
+    client.post(
+        "/",
+        data={"export_file": (BytesIO(WXR), "test.xml")},
+        content_type="multipart/form-data",
+    )
+    started = client.post(
+        "/api/upload-session",
+        json={"filename": "again.xml", "size": len(WXR), "total_chunks": 1},
+    )
+    pending_id = started.get_json()["upload_id"]
+    client.post(
+        "/api/upload-chunk/0", data=WXR,
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert store.get_chunk(pending_id, 0) == WXR
+    assert client.delete("/api/audit").status_code == 200
+    assert store.get_chunk(pending_id, 0) is None
+
+
+def test_decision_write_conflicts_when_revision_changes():
+    from audit_store import AuditStore, RevisionConflict
+
+    store = AuditStore()
+    store.save_decisions("a", {"3": "keep"})
+    store.save_decisions("a", {"3": "approved"}, expected_rev=1)
+    try:
+        store.save_decisions("a", {"3": "candidate"}, expected_rev=1)
+        raise AssertionError("Stale revision must conflict.")
+    except RevisionConflict as exc:
+        assert exc.current_rev == 2
+

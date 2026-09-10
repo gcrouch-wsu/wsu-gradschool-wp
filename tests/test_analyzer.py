@@ -96,14 +96,24 @@ def test_menu_and_content_links_propagate_reachability():
 
 def test_expected_development_rule_keeps_underlying_finding():
     _, rows = _rows_by_id()
-    assert rows["3"]["classification"] == "expected-development"
+    assert rows["3"]["classification"] == "unreferenced"
     assert rows["3"]["underlying_classification"] == "unreferenced"
+    assert rows["3"]["expected_development"] is True
 
 
 def test_query_urls_do_not_collapse_to_the_same_root_path():
     first = url_keys("https://example.test/?attachment_id=4")
     second = url_keys("https://example.test/?attachment_id=5")
     assert first.isdisjoint(second)
+
+
+def test_cross_host_urls_do_not_share_path_keys():
+    local = url_keys("https://example.test/foo", "https://example.test")
+    external = url_keys("https://other.test/foo", "https://example.test")
+    assert "path:/foo" in local
+    assert "path:/foo" not in external
+    tracking = url_keys("https://example.test/foo?utm_source=x", "https://example.test")
+    assert "path:/foo" in tracking
 
 
 def test_report_exposes_wordpress_groups_and_typed_taxonomies():
@@ -116,12 +126,13 @@ def test_report_exposes_wordpress_groups_and_typed_taxonomies():
     assert rows["1"]["wp_admin_url"] == "https://example.test/wp-admin/post.php?post=1&action=edit"
 
 
-def test_published_events_are_reachable_from_the_calendar_archive():
-    _, rows = _rows_by_id()
+def test_published_events_need_archive_verification():
+    report, rows = _rows_by_id()
     assert rows["20"]["group"] == "events"
-    assert rows["20"]["classification"] == "linked"
-    assert rows["20"]["confidence"] == "medium"
-    assert rows["20"]["evidence"][0]["kind"] == "archive"
+    assert rows["20"]["classification"] == "needs-verification"
+    assert rows["20"]["confidence"] == "low"
+    assert any(entry["kind"] == "archive" for entry in rows["20"]["evidence"])
+    assert any("theme location" in warning for warning in report["warnings"])
 
 
 def test_tablepress_shortcode_links_the_table_record():
@@ -166,6 +177,7 @@ def test_report_surfaces_warnings_and_taxonomy_slugs():
     catalog = next(taxonomy for taxonomy in report["taxonomies_by_group"]["pages"] if taxonomy["key"] == "category")
     assert catalog["unique_terms"] == 1
     assert catalog["terms"][0]["name"] == "News"
+    assert catalog["terms"][0]["slug"] == "news"
     assert pages["taxonomy_count"] == 1
 
 
@@ -190,9 +202,16 @@ def test_shortcodes_and_reusable_blocks_create_references():
     <wp:post_type>document</wp:post_type><wp:post_parent>0</wp:post_parent>
   </item>
   <item>
-    <title>Contact form</title><link>https://example.test/form/7</link>
+    <title>Unrelated seven</title><link>https://example.test/seven</link>
     <dc:creator>editor</dc:creator><content:encoded></content:encoded><excerpt:encoded></excerpt:encoded>
     <wp:post_id>7</wp:post_id><wp:post_date>2026-01-01 00:00:00</wp:post_date>
+    <wp:post_modified>2026-01-02 00:00:00</wp:post_modified><wp:status>publish</wp:status>
+    <wp:post_type>page</wp:post_type><wp:post_parent>0</wp:post_parent>
+  </item>
+  <item>
+    <title>Contact form</title><link>https://example.test/form/700</link>
+    <dc:creator>editor</dc:creator><content:encoded></content:encoded><excerpt:encoded></excerpt:encoded>
+    <wp:post_id>700</wp:post_id><wp:post_date>2026-01-01 00:00:00</wp:post_date>
     <wp:post_modified>2026-01-02 00:00:00</wp:post_modified><wp:status>publish</wp:status>
     <wp:post_type>wsuwp_form</wp:post_type><wp:post_parent>0</wp:post_parent>
     <wp:postmeta><wp:meta_key>_gform-form-id</wp:meta_key><wp:meta_value>7</wp:meta_value></wp:postmeta>
@@ -206,8 +225,9 @@ def test_shortcodes_and_reusable_blocks_create_references():
     assert rows["8"]["group"] == "documents"
     assert rows["8"]["classification"] == "linked"
     assert any(entry["kind"] == "document-shortcode" for entry in rows["8"]["evidence"])
-    assert rows["7"]["group"] == "forms"
-    assert any(entry["kind"] == "gravityform" for entry in rows["7"]["evidence"])
+    assert rows["700"]["group"] == "forms"
+    assert any(entry["kind"] == "gravityform" for entry in rows["700"]["evidence"])
+    assert not any(entry["kind"] == "gravityform" for entry in rows["7"]["evidence"])
 
 
 def test_parser_skips_non_canonical_wordpress_ids():

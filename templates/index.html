@@ -85,7 +85,7 @@
             <strong>Analysis limits</strong>
             <span>{{ report['warnings']|length }} warning{{ 's' if report['warnings']|length != 1 else '' }} qualify these findings.{% if report['stats']['unresolved_internal_urls'] %} {{ report['stats']['unresolved_internal_urls'] }} unresolved internal URL{{ 's' if report['stats']['unresolved_internal_urls'] != 1 else '' }} were also recorded.{% endif %}</span>
             <ul class="warning-list">
-              {% for warning in report['warnings'][:8] %}
+              {% for warning in report['warnings'][:25] %}
                 <li>{{ warning }}</li>
               {% endfor %}
             </ul>
@@ -215,7 +215,7 @@
     <div id="detail-content"></div>
   </dialog>
 
-  <script id="runtime-data" type="application/json">{{ {'chunk_size': chunk_size, 'storage_mode': storage_mode, 'rest_enabled': rest_enabled, 'rest_write_enabled': rest_write_enabled}|tojson }}</script>
+      <script id="runtime-data" type="application/json">{{ {'chunk_size': chunk_size, 'storage_mode': storage_mode, 'rest_enabled': rest_enabled, 'rest_write_enabled': rest_write_enabled, 'write_csrf': write_csrf}|tojson }}</script>
   <div class="loading" id="loading" hidden role="status"><div class="spinner" aria-hidden="true"></div><strong id="loading-label">Preparing the WordPress export</strong><span id="loading-detail">Building the inventory, taxonomies, and reference graph…</span><progress id="upload-progress" max="100" value="0"></progress></div>
 </body>
 </html>

@@ -15,27 +15,50 @@ def wordpress_id(value) -> str | None:
 
 
 def canonical_host(url: str) -> str:
+    identity = site_identity(url)
+    return identity[1] if identity else ""
+
+
+def site_identity(url: str) -> tuple[str, str, int, str] | None:
+    """Return scheme, hostname, port, and site path for WordPress installation binding."""
     candidate = (url or "").strip()
     if not candidate:
-        return ""
+        return None
     if "://" not in candidate:
         candidate = f"https://{candidate}"
     try:
-        host = (urlsplit(candidate).hostname or "").casefold().rstrip(".")
+        parsed = urlsplit(candidate)
+        host = (parsed.hostname or "").casefold().rstrip(".")
+        port = parsed.port
     except ValueError:
-        return ""
+        return None
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in {"http", "https"} or not host:
+        return None
     if host.startswith("www."):
-        return host[4:]
-    return host
+        host = host[4:]
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    path = (parsed.path or "/").rstrip("/") or "/"
+    return scheme, host, port, path
+
+
+def same_http_origin(left: str, right: str) -> bool:
+    """True when two URLs share scheme, hostname, and port. Path may differ."""
+    first = site_identity(left)
+    second = site_identity(right)
+    if not first or not second:
+        return False
+    return first[:3] == second[:3]
 
 
 def rest_base_url_allowed(url: str) -> bool:
     """Application Passwords may travel only over HTTPS, or HTTP to loopback."""
     try:
         parsed = urlsplit((url or "").strip())
+        host = (parsed.hostname or "").casefold()
     except ValueError:
         return False
-    host = (parsed.hostname or "").casefold()
     if not host:
         return False
     if parsed.scheme.lower() == "https":
@@ -44,7 +67,11 @@ def rest_base_url_allowed(url: str) -> bool:
 
 
 def sites_are_same(export_urls: list[str], rest_url: str) -> bool:
-    rest_host = canonical_host(rest_url)
-    if not rest_host:
+    rest = site_identity(rest_url)
+    if not rest:
         return False
-    return any(canonical_host(url) == rest_host for url in export_urls if url)
+    return any(site_identity(url) == rest for url in export_urls if url)
+
+
+def is_loopback_address(value: str) -> bool:
+    return (value or "").casefold().strip("[]") in LOOPBACK_HOSTS

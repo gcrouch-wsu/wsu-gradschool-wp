@@ -32,6 +32,8 @@ GRAVITY_FORM_RE = re.compile(r"\[gravityform(?:s)?[^\]]*\bid\s*=\s*[\"']?(\d+)",
 DOCUMENT_SHORTCODE_RE = re.compile(r"\[(?:document|wsu_document)[^\]]*\bid\s*=\s*[\"']?(\d+)", re.IGNORECASE)
 NUMBER_RE = re.compile(r"\d+")
 MAX_BODY_SCAN = 1_000_000
+MAX_META_SCAN = 2_000_000
+MAX_REFERENCES = 250_000
 
 STRUCTURAL_POST_TYPES = {
     "nav_menu_item",
@@ -228,7 +230,11 @@ def analyze_export(
     """Build a link graph and return an explainable, browser-ready report."""
     expected_aliases = {
         alias.casefold().strip()
-        for alias in (expected_author_aliases or {"greg crouch", "gcrouch"})
+        for alias in (
+            expected_author_aliases
+            if expected_author_aliases is not None
+            else {"greg crouch", "gcrouch"}
+        )
         if alias.strip()
     }
     base_url = export.site_url or export.home_url
@@ -249,6 +255,7 @@ def analyze_export(
     references: set[Reference] = set()
     roots: set[str] = set()
     unresolved_internal: set[str] = set()
+    incomplete_scans: set[str] = set()
     site_hosts = {
         urlsplit(normalized).hostname
         for normalized in (normalize_url(export.site_url), normalize_url(export.home_url))
@@ -264,6 +271,13 @@ def analyze_export(
         evidence: str,
     ) -> None:
         if not target_id or target_id not in reportable or source_id == target_id:
+            return
+        if len(references) >= MAX_REFERENCES:
+            export.warnings.append(
+                f"Stopped recording references after {MAX_REFERENCES:,} edges; later evidence was not classified."
+            )
+            if source_id in reportable:
+                incomplete_scans.add(source_id)
             return
         references.add(
             Reference(
@@ -299,7 +313,7 @@ def analyze_export(
     public_statuses = {"publish", "inherit"}
     menu_items = [item for item in export.items if item.post_type == "nav_menu_item"]
     for menu in menu_items:
-        if menu.status and menu.status not in public_statuses:
+        if menu.status != "publish":
             continue
         object_ids = menu.meta.get("_menu_item_object_id", [])
         custom_urls = menu.meta.get("_menu_item_url", [])
@@ -314,6 +328,13 @@ def analyze_export(
             )
             roots.update(targets)
 
+    forms_by_gform_id: dict[str, list[str]] = defaultdict(list)
+    for item in reportable.values():
+        for form_id in item.meta.get("_gform-form-id", []):
+            mapped = wordpress_id(form_id)
+            if mapped:
+                forms_by_gform_id[mapped].append(item.id)
+
     # The item matching the exported home URL is also a trusted entry point.
     home_keys = url_keys(export.home_url or export.site_url, base_url)
     for key in home_keys:
@@ -321,13 +342,12 @@ def analyze_export(
 
     for item in reportable.values():
         if item.post_type in ARCHIVE_ENTRY_TYPES and item.status == "publish":
-            roots.add(item.id)
             add_reference(
                 f"archive:{item.post_type}",
                 item.id,
                 "archive",
                 "post_type_archive",
-                "strong",
+                "possible",
                 ARCHIVE_ENTRY_TYPES[item.post_type],
             )
 
@@ -343,12 +363,14 @@ def analyze_export(
                 continue
             if len(body) > MAX_BODY_SCAN:
                 export.warnings.append(f"Only the first {MAX_BODY_SCAN:,} characters of item {item.id} {field_name} were scanned.")
+                incomplete_scans.add(item.id)
                 body = body[:MAX_BODY_SCAN]
             parser = _ReferenceHTMLParser()
             try:
                 parser.feed(body)
             except Exception:
                 export.warnings.append(f"HTML reference parsing was incomplete for item {item.id}.")
+                incomplete_scans.add(item.id)
             for raw_url, kind in parser.urls:
                 add_url_reference(item.id, raw_url, kind, field_name, "strong")
 
@@ -376,8 +398,16 @@ def analyze_export(
                 if target_id:
                     add_reference(item.id, target_id, "tablepress", field_name, "strong", match.group(0))
             for match in GRAVITY_FORM_RE.finditer(body):
-                target_id = wordpress_id(match.group(1))
-                if target_id:
+                form_id = wordpress_id(match.group(1))
+                if not form_id:
+                    continue
+                mapped_ids = forms_by_gform_id.get(form_id)
+                if not mapped_ids:
+                    export.warnings.append(
+                        f"Gravity Form {form_id} is referenced by item {item.id} but no exported post has _gform-form-id {form_id}."
+                    )
+                    continue
+                for target_id in mapped_ids:
                     add_reference(item.id, target_id, "gravityform", field_name, "possible", match.group(0))
             for match in DOCUMENT_SHORTCODE_RE.finditer(body):
                 target_id = wordpress_id(match.group(1))
@@ -389,7 +419,11 @@ def analyze_export(
             if meta_key in {"_menu_item_url", "_menu_item_object_id", "_thumbnail_id", "_wp_attached_file"}:
                 continue
             for value in values:
-                if not value or len(value) > 2_000_000:
+                if not value:
+                    continue
+                if len(value) > MAX_META_SCAN:
+                    export.warnings.append(f"Skipped oversized custom field {meta_key} on item {item.id}.")
+                    incomplete_scans.add(item.id)
                     continue
                 for raw_url in URL_RE.findall(value):
                     add_url_reference(item.id, raw_url.rstrip(".,);]"), "meta-url", meta_key, "possible")
@@ -434,16 +468,23 @@ def analyze_export(
         taxonomies = sorted({f"{term.taxonomy}: {term.name}" for term in item.terms})
         taxonomy_terms: dict[str, list[str]] = defaultdict(list)
         taxonomy_slugs: dict[str, list[str]] = defaultdict(list)
+        taxonomy_pairs: dict[str, list[dict[str, str]]] = defaultdict(list)
+        seen_pairs: set[tuple[str, str, str]] = set()
         for term in item.terms:
             taxonomy_terms[term.taxonomy].append(term.name)
             if term.slug:
                 taxonomy_slugs[term.taxonomy].append(term.slug)
+            pair_key = (term.taxonomy, term.slug, term.name)
+            if pair_key not in seen_pairs:
+                seen_pairs.add(pair_key)
+                taxonomy_pairs[term.taxonomy].append({"slug": term.slug, "name": term.name})
         taxonomy_terms = {
             key: sorted(set(values)) for key, values in sorted(taxonomy_terms.items())
         }
         taxonomy_slugs = {
             key: sorted(set(values)) for key, values in sorted(taxonomy_slugs.items())
         }
+        taxonomy_pairs = {key: values for key, values in sorted(taxonomy_pairs.items())}
         reasons: list[str] = []
 
         if not is_public:
@@ -453,13 +494,9 @@ def analyze_export(
             reasons.append(f"The exported status is {item.status or 'unknown'}.")
         elif item.id in reachable:
             base_classification = "linked"
-            archive_only = bool(strong_inbound) and all(reference.kind == "archive" for reference in strong_inbound)
-            confidence = "medium" if archive_only else "high"
+            confidence = "high"
             recommendation = "Keep unless content review indicates otherwise."
-            if archive_only:
-                reasons.append("Assumed reachable from a public content archive. The export cannot prove that archive is enabled or lists this record.")
-            else:
-                reasons.append("Reachable from an exported menu, the site home URL, a public content archive, or linked reachable content.")
+            reasons.append("Reachable from an exported menu, the site home URL, or linked reachable content.")
         elif is_media and strong_inbound:
             base_classification = "linked"
             confidence = "high"
@@ -483,8 +520,11 @@ def analyze_export(
         elif possible_inbound:
             base_classification = "needs-verification"
             confidence = "low"
-            recommendation = "Inspect the custom-field evidence and verify the live site."
-            reasons.append("Only possible references in custom metadata were found.")
+            recommendation = "Inspect the custom-field or archive evidence and verify the live site."
+            if any(reference.kind == "archive" for reference in possible_inbound):
+                reasons.append("Assumed discoverable from a public content archive. The export cannot prove that archive is enabled or lists this record.")
+            else:
+                reasons.append("Only possible references in custom metadata were found.")
         else:
             base_classification = "unreferenced"
             confidence = "medium" if structural_inbound or categories else "high"
@@ -498,9 +538,11 @@ def analyze_export(
 
         classification = base_classification
         if expected_author and base_classification not in {"linked", "non-public"}:
-            classification = "expected-development"
             reasons.insert(0, "The author matches the configured Greg Crouch development-content rule.")
             recommendation = "Confirm whether development is complete; retain or delete intentionally."
+        if incomplete_scans and base_classification in {"unreferenced", "unreferenced-media"}:
+            confidence = "low"
+            reasons.append("Some exported content or custom fields were not fully scanned, so missing references may exist.")
 
         evidence = []
         for reference in sorted(inbound, key=lambda ref: (ref.strength, ref.kind, ref.source_id)):
@@ -563,6 +605,7 @@ def analyze_export(
             "taxonomies": taxonomies,
             "taxonomy_terms": taxonomy_terms,
             "taxonomy_slugs": taxonomy_slugs,
+            "taxonomy_pairs": taxonomy_pairs,
             "meta_keys": sorted(item.meta),
             "classification": classification,
             "underlying_classification": base_classification,
@@ -593,7 +636,11 @@ def analyze_export(
     rows.sort(key=lambda row: (priority.get(row["classification"], 99), row["title"].casefold(), row["id"]))
 
     warnings = list(dict.fromkeys(export.warnings))
-    if not menu_items:
+    if menu_items:
+        warnings.append(
+            "Exported navigation items are treated as entry points; the export does not prove they are assigned to a live theme location."
+        )
+    else:
         warnings.append("No navigation menu items were present; reachability classifications are less reliable.")
     warnings.append(
         "Export-only analysis cannot see hard-coded theme links, external links, every plugin field, or all live rendered behavior."
@@ -606,7 +653,7 @@ def analyze_export(
         "public_items": sum(row["status"] in public_statuses for row in rows),
         "media_items": sum(row["type"] == "attachment" for row in rows),
         "review_candidates": sum(row["classification"] in review_classes for row in rows),
-        "expected_development": classification_counts["expected-development"],
+        "expected_development": sum(bool(row["expected_development"]) for row in rows),
         "linked": classification_counts["linked"],
         "menu_items": len(menu_items),
         "references": len(references),
@@ -627,14 +674,27 @@ def analyze_export(
         finding_counts = Counter(row["classification"] for row in members)
         subtype_counts = Counter(row["content_class"] for row in members)
 
-        taxonomy_term_counts: dict[str, Counter[str]] = defaultdict(Counter)
+        taxonomy_term_counts: dict[str, Counter[tuple[str, str]]] = defaultdict(Counter)
         taxonomy_record_counts: Counter[str] = Counter()
         taxonomy_unique_keys: dict[str, set[str]] = defaultdict(set)
         for row in members:
+            pairs_by_tax = row.get("taxonomy_pairs") or {}
+            if pairs_by_tax:
+                for taxonomy, pairs in pairs_by_tax.items():
+                    taxonomy_record_counts[taxonomy] += 1
+                    for pair in pairs:
+                        slug = pair.get("slug") or pair.get("name") or ""
+                        name = pair.get("name") or slug
+                        if not slug:
+                            continue
+                        taxonomy_term_counts[taxonomy][(slug, name)] += 1
+                        taxonomy_unique_keys[taxonomy].add(slug)
+                continue
             for taxonomy, terms in row["taxonomy_terms"].items():
                 taxonomy_record_counts[taxonomy] += 1
-                taxonomy_term_counts[taxonomy].update(terms)
-                taxonomy_unique_keys[taxonomy].update(row.get("taxonomy_slugs", {}).get(taxonomy) or terms)
+                for name in terms:
+                    taxonomy_term_counts[taxonomy][(name, name)] += 1
+                    taxonomy_unique_keys[taxonomy].update(row.get("taxonomy_slugs", {}).get(taxonomy) or [name])
 
         taxonomies = []
         for taxonomy, term_counts in sorted(
@@ -649,9 +709,9 @@ def analyze_export(
                     "assignments": sum(term_counts.values()),
                     "records_tagged": taxonomy_record_counts[taxonomy],
                     "terms": [
-                        {"name": name, "count": count}
-                        for name, count in sorted(
-                            term_counts.items(), key=lambda pair: (-pair[1], pair[0].casefold())
+                        {"name": name, "slug": slug, "count": count}
+                        for (slug, name), count in sorted(
+                            term_counts.items(), key=lambda pair: (-pair[1], pair[0][1].casefold(), pair[0][0])
                         )
                     ],
                 }
@@ -665,7 +725,7 @@ def analyze_export(
             "count": len(members),
             "public": sum(row["status"] in public_statuses for row in members),
             "review_candidates": sum(row["classification"] in review_classes for row in members),
-            "expected_development": finding_counts["expected-development"],
+            "expected_development": sum(bool(row["expected_development"]) for row in members),
             "linked": finding_counts["linked"],
             "status_counts": dict(sorted(status_counts.items())),
             "finding_counts": dict(sorted(finding_counts.items())),

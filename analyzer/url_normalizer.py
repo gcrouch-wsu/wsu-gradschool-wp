@@ -6,6 +6,18 @@ from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 
 
 IMAGE_VARIANT_RE = re.compile(r"(?:-\d+x\d+|-scaled|-rotated)(?=\.[^./]+$)", re.IGNORECASE)
+WP_IDENTITY_QUERY_RE = re.compile(
+    r"(?:^|&)(?:p|page_id|attachment_id|name|post_type)=",
+    re.IGNORECASE,
+)
+
+
+def _hostname(url: str) -> str:
+    try:
+        host = (urlsplit(url).hostname or "").casefold().rstrip(".")
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
 
 
 def normalize_url(value: str, base_url: str = "") -> str:
@@ -22,15 +34,14 @@ def normalize_url(value: str, base_url: str = "") -> str:
 
     try:
         parsed = urlsplit(candidate)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return ""
+        port = parsed.port
     except ValueError:
-        return ""
-
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         return ""
 
     scheme = parsed.scheme.lower()
     host = parsed.hostname.lower().rstrip(".")
-    port = parsed.port
     if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
         host = f"{host}:{port}"
 
@@ -48,18 +59,21 @@ def public_href(value: str) -> str:
 
 
 def url_keys(value: str, base_url: str = "") -> set[str]:
-    """Produce host-aware and path-aware keys for resolving migrated WordPress URLs."""
+    """Produce same-site keys. Cross-host URLs never share a path-only key."""
     normalized = normalize_url(value, base_url)
     if not normalized:
         return set()
 
-    parsed = urlsplit(normalized)
-    path_key = parsed.path or "/"
     keys = {normalized}
+    parsed = urlsplit(normalized)
+    if base_url and _hostname(normalized) != _hostname(normalize_url(base_url) or base_url):
+        return keys
+
+    path_key = parsed.path or "/"
     if parsed.query:
-        # A query can be the identity (for example /?attachment_id=123), so do not
-        # collapse every query URL on the same path into one target.
         keys.add(f"path:{path_key}?{parsed.query}")
+        if not WP_IDENTITY_QUERY_RE.search(parsed.query):
+            keys.add(f"path:{path_key}")
     else:
         keys.add(f"path:{path_key}")
     return keys

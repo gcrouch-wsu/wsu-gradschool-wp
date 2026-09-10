@@ -3,13 +3,15 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 from datetime import datetime, timezone
+from html import unescape
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from .ids import rest_base_url_allowed, wordpress_id
+from .ids import rest_base_url_allowed, same_http_origin, wordpress_id
 
 
 REST_BASES = {
@@ -64,6 +66,19 @@ def _resource_url(base_url: str, rest_base: str, item_id: str) -> str | None:
     return f"{base_url.rstrip('/')}/wp-json/wp/v2/{safe_base}/{safe_id}"
 
 
+class _SameOriginRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is None:
+            return None
+        if not same_http_origin(req.full_url, redirected.full_url):
+            raise URLError("Refused cross-origin WordPress REST redirect.")
+        return redirected
+
+
+_OPENER = build_opener(_SameOriginRedirectHandler)
+
+
 def _read_json_response(raw: str, fallback: str) -> Any:
     if not raw:
         return []
@@ -79,17 +94,17 @@ def _http_request(
     timeout: int,
     method: str,
     body: dict[str, Any] | None = None,
-) -> tuple[int, Any]:
+) -> tuple[int, Any, dict[str, str]]:
     data = json.dumps(body).encode("utf-8") if body is not None else None
     request_headers = dict(headers)
     if data is not None:
         request_headers["Content-Type"] = "application/json"
     request = Request(url, data=data, headers=request_headers, method=method)
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with _OPENER.open(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8")
-            headers = {key.lower(): str(value) for key, value in response.headers.items()}
-            return response.status, _read_json_response(raw, str(response.status)), headers
+            response_headers = {key.lower(): str(value) for key, value in response.headers.items()}
+            return response.status, _read_json_response(raw, str(response.status)), response_headers
     except HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
         parsed = _read_json_response(raw, str(exc.reason))
@@ -156,6 +171,8 @@ class WordPressRestClient:
             "_fields": "id,status,link,modified,type",
         }
         collected: list[Any] = []
+        requested = set(safe_ids)
+        seen_ids: set[str] = set()
         page = 1
         while page <= 20:
             query["page"] = str(page)
@@ -165,7 +182,18 @@ class WordPressRestClient:
                 return status, payload
             if not isinstance(payload, list):
                 return 502, {"message": "WordPress REST returned an unexpected list payload."}
-            collected.extend(payload)
+            page_records = []
+            for record in payload:
+                record_id = wordpress_id(record.get("id") if isinstance(record, dict) else None)
+                if not record_id or record_id not in requested or record_id in seen_ids:
+                    continue
+                seen_ids.add(record_id)
+                page_records.append(record)
+            if payload and not page_records:
+                if page > 1:
+                    return 502, {"message": "WordPress REST pagination did not advance."}
+                return 502, {"message": "WordPress REST returned records that were not in the include list."}
+            collected.extend(page_records)
             try:
                 total_pages = int(headers.get("x-wp-totalpages") or 0)
             except ValueError:
@@ -175,7 +203,7 @@ class WordPressRestClient:
                     break
             elif not payload or len(payload) < int(query["per_page"]):
                 break
-            elif len(collected) >= len(safe_ids):
+            elif len(seen_ids) >= len(safe_ids):
                 break
             page += 1
         else:
@@ -249,9 +277,18 @@ def live_check_items(
         for start in range(0, len(ids), BATCH_SIZE):
             chunk = ids[start:start + BATCH_SIZE]
             status, payload = client.list_type(rest_base, chunk)
-            if status in {404, 501}:
+            if status == 501 or (
+                status == 404
+                and isinstance(payload, dict)
+                and str(payload.get("code") or "") == "rest_no_route"
+            ):
                 unsupported = True
                 break
+            if status == 404:
+                message = payload.get("message", "WordPress REST returned HTTP 404.") if isinstance(payload, dict) else "WordPress REST returned HTTP 404."
+                for item_id in chunk:
+                    results[item_id] = _empty_live(item_id, rest_base, "error", str(message))
+                continue
             if status in {401, 403}:
                 message = payload.get("message", "WordPress refused authenticated REST access.") if isinstance(payload, dict) else "WordPress refused authenticated REST access."
                 raise PermissionError(message)
@@ -307,6 +344,15 @@ def _media_trash_blocked(rest_base: str, message: str) -> bool:
     )
 
 
+def _rendered_title(payload: dict) -> str:
+    title = payload.get("title")
+    if isinstance(title, dict):
+        text = str(title.get("raw") or title.get("rendered") or "")
+    else:
+        text = str(title or "")
+    return re.sub(r"<[^>]+>", "", unescape(text)).strip()
+
+
 def trash_items(
     items: list[dict],
     client: WordPressRestClient,
@@ -314,7 +360,7 @@ def trash_items(
 ) -> list[dict]:
     """Move exported records to WordPress Trash. Never force-deletes."""
     results: list[dict] = []
-    for item in items:
+    for index, item in enumerate(items):
         item_id = wordpress_id(item.get("id"))
         rest_base = rest_base_for(item.get("type", ""))
         title = str(item.get("title") or item.get("file_name") or f"ID {item.get('id')}")
@@ -334,10 +380,23 @@ def trash_items(
                 "error": "This content type is not available through WordPress REST, so it cannot be trashed from this app.",
             })
             continue
-        preflight_status, current = client.get_item(rest_base, item_id)
+        try:
+            preflight_status, current = client.get_item(rest_base, item_id)
+        except (URLError, TimeoutError, OSError, ValueError) as exc:
+            results.append({
+                "id": item_id,
+                "ok": False,
+                "title": title,
+                "error": f"WordPress REST failed before Trash: {exc}",
+            })
+            continue
         if preflight_status in {401, 403}:
             message = _payload_message(current, "WordPress refused authenticated REST access.")
             results.append({"id": item_id, "ok": False, "title": title, "error": message})
+            for leftover in items[index + 1:]:
+                leftover_id = wordpress_id(leftover.get("id")) or str(leftover.get("id") or "")
+                leftover_title = str(leftover.get("title") or leftover.get("file_name") or leftover_id)
+                results.append({"id": leftover_id, "ok": False, "title": leftover_title, "error": message})
             break
         if preflight_status != 200 or not isinstance(current, dict) or str(current.get("id")) != item_id:
             results.append({
@@ -349,27 +408,59 @@ def trash_items(
             continue
         live_type = str(current.get("type") or "")
         expected_type = str(item.get("type") or "")
-        if live_type and expected_type and live_type != expected_type:
+        if not live_type or live_type != expected_type:
             results.append({
                 "id": item_id,
                 "ok": False,
                 "title": title,
-                "error": f"Live WordPress type {live_type} does not match the exported type {expected_type}.",
+                "error": (
+                    f"Live WordPress type {live_type or 'unknown'} does not match the exported type {expected_type}."
+                    if live_type
+                    else "Live WordPress did not return a type for this record, so Trash was refused."
+                ),
             })
             continue
-        status, payload = client.trash(rest_base, item_id)
+        live_title = _rendered_title(current)
+        if live_title and title and live_title.casefold() != title.casefold():
+            results.append({
+                "id": item_id,
+                "ok": False,
+                "title": title,
+                "error": f"Live WordPress title is now {live_title!r}, not the exported title. Re-check before Trash.",
+            })
+            continue
+        try:
+            status, payload = client.trash(rest_base, item_id)
+        except (URLError, TimeoutError, OSError, ValueError) as exc:
+            results.append({
+                "id": item_id,
+                "ok": False,
+                "title": title,
+                "error": f"WordPress REST failed during Trash: {exc}. Local live state was not updated.",
+            })
+            continue
         if status in {401, 403}:
             message = _payload_message(payload, "WordPress refused authenticated REST access.")
             results.append({"id": item_id, "ok": False, "title": title, "error": message})
+            for leftover in items[index + 1:]:
+                leftover_id = wordpress_id(leftover.get("id")) or str(leftover.get("id") or "")
+                leftover_title = str(leftover.get("title") or leftover.get("file_name") or leftover_id)
+                results.append({"id": leftover_id, "ok": False, "title": leftover_title, "error": message})
             break
         if status in {200, 201} and isinstance(payload, dict):
+            returned_id = wordpress_id(payload.get("id"))
+            returned_type = str(payload.get("type") or "")
             live_status = str(payload.get("status") or "")
-            if live_status != "trash":
+            if returned_id != item_id or (returned_type and returned_type != expected_type) or live_status != "trash":
                 results.append({
                     "id": item_id,
                     "ok": False,
                     "title": title,
-                    "error": f"WordPress returned status {live_status or 'unknown'} instead of trash.",
+                    "error": (
+                        f"WordPress returned status {live_status or 'unknown'} instead of trash."
+                        if live_status != "trash"
+                        else "WordPress Trash response identity did not match the selected record."
+                    ),
                 })
                 continue
             live_state = "trashed"
@@ -377,9 +468,7 @@ def trash_items(
             live["live_status"] = live_status
             live["live_link"] = str(payload.get("link") or "")
             live["live_modified"] = str(payload.get("modified") or "")
-            post_type = str(payload.get("type") or item.get("type") or "")
-            if live_state == "trashed":
-                live["wp_admin_url"] = wp_admin_trash_url(site_url, post_type)
+            live["wp_admin_url"] = wp_admin_trash_url(site_url, returned_type or expected_type)
             results.append({"id": item_id, "ok": True, "title": title, "live": live, "error": ""})
             continue
         message = _payload_message(payload, f"WordPress REST returned HTTP {status}.")

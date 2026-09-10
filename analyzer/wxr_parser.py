@@ -10,6 +10,9 @@ from .ids import wordpress_id
 from .models import Author, ContentItem, Term, WXRExport
 
 
+MAX_EXPORT_ITEMS = 40_000
+
+
 CONTENT_NAMESPACE = "http://purl.org/rss/1.0/modules/content/"
 EXCERPT_NAMESPACE = "http://wordpress.org/export/1.2/excerpt/"
 
@@ -83,6 +86,10 @@ def parse_wxr(file_stream: BinaryIO) -> WXRExport:
         if post_id in seen_ids:
             warnings.append(f"Duplicate WordPress item ID {post_id} was found; URL resolution may be ambiguous.")
         seen_ids.add(post_id)
+        if len(items) >= MAX_EXPORT_ITEMS:
+            raise ValueError(
+                f"This export has more than {MAX_EXPORT_ITEMS:,} records and exceeds the analyzer bound."
+            )
 
         author_login = _text(element, "creator")
         author = authors.get(author_login, Author(login=author_login))

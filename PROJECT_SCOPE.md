@@ -19,10 +19,10 @@ The working application now:
 - Preserves media filename, MIME type, extension, exported file size, dimensions, ALT text, stored path, and generated image variants when present.
 - Extracts references from content, excerpts, menus, parent relationships, featured images, attachment relationships, Gutenberg/block markup, shortcodes, and useful custom fields.
 - Separates strong, possible, and structural references and retains where-used evidence.
-- Identifies expected development content using configurable Greg Crouch author aliases without hiding that content.
+- Identifies expected development content using configurable Greg Crouch author aliases without replacing the underlying finding.
 - Provides server-side search, filters, pagination, taxonomy drill-down, record details, in-memory review decisions, a cross-group work queue, and filtered CSV/JSON exports.
-- Locally, can check a group against live WordPress REST and move selected records to Trash after confirmation. Trash uses WordPress `DELETE` without `force`.
-- Treats published Events Calendar and graduate factsheet records as reachable from their public archives.
+- Locally, can check a group against live WordPress REST and move selected records to Trash after confirmation. Trash uses WordPress `DELETE` without `force`, requires a found live check plus candidate/approved review, and is loopback- and CSRF-gated.
+- Marks published Events Calendar and graduate factsheet records as needing verification from an assumed public archive; it does not treat that archive as proven reachability.
 - Escapes displayed content and protects CSV cells from spreadsheet formula injection.
 
 ## Current export results
@@ -41,7 +41,7 @@ The September 9, 2026 Graduate School export contains 6,599 raw records and 6,46
 | Graduate Factsheets | 213 | 196 | 177 | 2 |
 | Other Content | 195 | 192 | 159 | 0 |
 
-These are review counts, not deletion counts. A WXR-only finding must be verified before deletion. Published Events and graduate factsheets are now treated as archive-reachable, so those review counts from the September 9 export will drop after re-analysis.
+These are review counts from that export snapshot, not deletion counts, and they predate archive-assumption and expected-development display changes. Re-analyze the current export to refresh them. A WXR-only finding must be verified before deletion.
 
 ## Content organization
 
@@ -65,9 +65,9 @@ The tool deliberately uses several explainable conditions instead of one absolut
 2. **Unreferenced media** — an attachment is not linked, embedded, used as a featured image, or found in a recognized URL/custom-field reference. A parent/child association alone does not prove a rendered use.
 3. **Disconnected island** — references exist, but neither the record nor its sources are reachable from recognized site entry points.
 4. **Needs verification** — evidence is incomplete, indirect, or held in a structure that requires human/live-site confirmation.
-5. **Expected development** — the record matches an explicit development-author rule, currently Greg Crouch / `gcrouch`; its underlying finding remains available.
+5. **Expected development** — an independent identity flag for configured development-author aliases, currently Greg Crouch / `gcrouch`. The primary finding remains the underlying classification.
 6. **Non-public** — the record is draft, private, pending, trashed, or otherwise not public.
-7. **Linked** — useful inbound evidence was found.
+7. **Linked** — useful inbound evidence was found from a menu, the home URL, or linked reachable content. Assumed public archives are not sufficient for this finding.
 
 Confidence and reasons accompany each finding. Authorship alone is never evidence that deletion is safe.
 
@@ -95,7 +95,7 @@ Consequently, “unreferenced in export” means exactly that. It is not equival
 
 - Stay local-only for WordPress REST credentials and writes. Never put `WP_REST_*` on Vercel.
 - Trash is opt-in (`WP_REST_WRITE_ENABLED`), confirmed in the UI, and never uses WordPress `force` delete.
-- Keep uploaded data and review decisions local and in memory for the current local-dev phase. On Vercel, reports use private Blob storage; abandoned upload chunks still need TTL cleanup.
+- Keep uploaded data and review decisions local and in memory for the current local-dev phase. On Vercel, reports use private Blob storage; abandoned upload chunks expire after one hour when a later upload refreshes the chunk index.
 - Parse XML with protections appropriate for untrusted uploads.
 - Preserve original evidence while normalizing URLs for matching.
 - Escape uploaded values in the interface.
@@ -165,12 +165,12 @@ A WXR export remains required for the current orphan/where-used graph. REST is a
 
 **Write preflight required before expanding REST-first inventory**
 
-- Bind the export or crawl to a verified site identity (canonical host) matching `WP_REST_BASE_URL`.
-- Re-fetch the current ID, type, title, and status from that site immediately before Trash.
-- Discover each endpoint’s schema, page size, and pagination; incomplete list responses are errors, not “missing.”
+- Bind the export or crawl to a verified site identity (scheme, host, port, and site path) matching `WP_REST_BASE_URL`.
+- Re-fetch the current ID, type, title, and status from that site immediately before Trash; refuse on identity drift.
+- Discover each endpoint’s schema, page size, and pagination; incomplete or off-contract list responses are errors, not “missing.”
 - Represent REST vs WXR conflicts and completeness per field/group instead of silently preferring one source.
-- Use least-privilege, revocable Application Passwords; require HTTPS except loopback.
-- Define snapshot consistency, retry/rate-limit behavior, and stale-write protection before enabling REST-first writes.
+- Use least-privilege, revocable Application Passwords; require HTTPS except loopback; refuse cross-origin redirects.
+- Do not enable REST-first writes until these are measurable per group: snapshot watermark (checked_at + source), cross-endpoint consistency, capability discovery (route, status enum, include/pagination contract), conflict-resolution (revisioned live/decision writes), resumability, and an explicit complete / partial / unavailable state.
 
 **Constraints this phase must respect**
 
