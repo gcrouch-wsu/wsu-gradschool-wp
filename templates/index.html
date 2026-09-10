@@ -152,11 +152,14 @@
             </div>
 
             <div class="table-toolbar">
-              <p id="result-count" aria-live="polite">Loading content…</p>
+              <div>
+                <p id="result-count" aria-live="polite">Loading content…</p>
+                {% if rest_write_enabled %}<p class="trash-hint">Checkboxes and Trash stay locked until a record is found live and marked Candidate or Approved. Use the review sheet to do that.</p>{% endif %}
+              </div>
               <div class="table-toolbar-actions">
                 {% if rest_write_enabled %}
                   <span id="selection-count" class="selection-count">0 selected</span>
-                  <button class="button button-danger button-compact" id="bulk-trash" type="button" disabled>Move to Trash in WordPress</button>
+                  <button class="button button-danger button-compact" id="bulk-trash" type="button" disabled>Move to Trash</button>
                 {% endif %}
                 <label><span>Rows</span><select id="page-size"><option>25</option><option selected>50</option><option>100</option><option>200</option></select></label>
               </div>
@@ -164,8 +167,8 @@
             <div class="table-wrap">
               <table>
                 <thead><tr>
-                  {% if rest_write_enabled %}<th class="select-col"><label class="sr-only" for="select-page">Select page</label><input id="select-page" type="checkbox"></th>{% endif %}
-                  <th>Finding</th><th>Live</th><th>Content</th><th>Author</th><th>Taxonomies</th><th>Published</th><th>Last updated</th><th>Review</th><th><span class="sr-only">Review sheet</span></th>
+                  {% if rest_write_enabled %}<th class="select-col">Select<label class="sr-only" for="select-page">Select page</label><input id="select-page" type="checkbox"></th>{% endif %}
+                  <th>Finding</th><th>Live</th><th>Content</th><th>Author</th><th>Taxonomies</th><th>Published</th><th>Last updated</th><th>Review</th><th>Actions</th>
                 </tr></thead>
                 <tbody id="results-body"></tbody>
               </table>

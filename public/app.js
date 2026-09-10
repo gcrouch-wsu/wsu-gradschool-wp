@@ -31,6 +31,38 @@
     try { const parsed = new URL(url); return ["http:", "https:"].includes(parsed.protocol) ? parsed.href : ""; }
     catch { return ""; }
   };
+  function trashReason(item) {
+    if (!writeEnabled) return "Local WordPress Trash is not enabled.";
+    if (item.can_trash) return "";
+    if (item.live_state === "unchecked") return "Live-check this record first, then mark Candidate or Approved.";
+    if (item.live_state === "missing") return "This record was not found on live WordPress.";
+    if (item.live_state === "trashed") return "Already in WordPress Trash.";
+    if (item.live_state === "not-in-rest") return "This content type cannot be trashed through WordPress REST.";
+    if (item.live_state === "error") return "Live check failed, so Trash is blocked.";
+    if (!["candidate", "approved"].includes(item.review_decision)) return "Mark Candidate or Approved to enable Trash.";
+    return "Trash is not available for this record.";
+  }
+  function makeTrashButton(item, className) {
+    const button = el("button", className || "button button-danger button-compact", "Move to Trash");
+    button.type = "button";
+    const blocked = trashReason(item);
+    if (blocked) {
+      button.disabled = true;
+      button.title = blocked;
+      return button;
+    }
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (qs("#detail-dialog")?.open && review.item && String(review.item.id) === String(item.id)) {
+        trashCurrentRecord(button);
+      } else {
+        trashRecords([item.id], [item.title || item.file_name || `ID ${item.id}`]).catch((error) => {
+          window.alert(error.message || "WordPress Trash failed.");
+        });
+      }
+    });
+    return button;
+  }
 
   function wireUpload(inputSelector, labelSelector) {
     const input = qs(inputSelector), label = qs(labelSelector), drop = input?.closest(".file-drop");
@@ -286,6 +318,8 @@
       if (item.author_name && item.author_login && item.author_name !== item.author_login) author.append(meta(item.author_login));
       taxonomy.append(taxonomySummary(item)); published.textContent = dateOnly(item.created); updated.textContent = dateOnly(item.modified); review.append(reviewSelect(item));
       const button = el("button", "button button-detail", "Review"); button.type = "button"; button.addEventListener("click", () => openDetails(item.id)); actions.append(button);
+      actions.className = "actions-cell";
+      if (writeEnabled) actions.append(makeTrashButton(item));
       if (writeEnabled) {
         const select = document.createElement("td");
         const box = el("input", "row-select");
@@ -319,6 +353,9 @@
         if (controls.live) setOptions(controls.live, payload.facets.live || [], "All live states");
       }
       renderRows(payload.items); qs("#result-count").textContent = `${payload.total.toLocaleString()} record${payload.total === 1 ? "" : "s"} in this view`;
+      if (writeEnabled && !qs(".trash-hint")) {
+        qs("#result-count").after(el("p", "trash-hint", "Checkboxes and Trash stay locked until a record is found live and marked Candidate or Approved. Open Review to do that."));
+      }
       if (state.queue) qs("#summary-strip").replaceChildren(summaryItem("In queue", payload.total, "Needs attention"));
       qs("#page-status").textContent = `Page ${payload.page.toLocaleString()} of ${payload.page_count.toLocaleString()}`;
       qs("#previous-page").disabled = payload.page <= 1; qs("#next-page").disabled = payload.page >= payload.page_count; qs("#empty-state").hidden = payload.total !== 0;
@@ -359,6 +396,7 @@
   function renderReviewToolbar(item, liveNote) {
     const toolbar = qs("#review-toolbar");
     toolbar.replaceChildren();
+    const decisions = el("div", "review-decisions");
     [
       ["keep", "Keep"],
       ["expected", "Expected"],
@@ -370,25 +408,23 @@
       button.type = "button";
       button.classList.toggle("is-active", item.review_decision === value);
       button.addEventListener("click", () => saveReviewDecision(value, { advance: value === "keep" }));
-      toolbar.append(button);
+      decisions.append(button);
     });
+    const actions = el("div", "review-actions");
+    const liveHref = safeLink(item.live_link) || safeLink(item.url);
+    if (liveHref) {
+      const publicLink = el("a", "button button-primary button-compact", item.live_link ? "View live page" : "View exported URL");
+      publicLink.href = liveHref; publicLink.target = "_blank"; publicLink.rel = "noopener noreferrer"; actions.append(publicLink);
+    }
     const adminHref = safeLink(item.wp_admin_url);
     if (adminHref) {
-      const admin = el("a", "button button-primary button-compact", item.live_state === "trashed" ? "Open Trash in WP" : "Open in WordPress");
-      admin.href = adminHref; admin.target = "_blank"; admin.rel = "noopener noreferrer"; toolbar.append(admin);
+      const admin = el("a", "button button-outline button-compact", item.live_state === "trashed" ? "Open wp-admin Trash" : "Edit in wp-admin");
+      admin.href = adminHref; admin.target = "_blank"; admin.rel = "noopener noreferrer"; actions.append(admin);
     }
-    const liveHref = safeLink(item.live_link || item.url);
-    if (liveHref) {
-      const publicLink = el("a", "button button-outline button-compact", "Open public URL");
-      publicLink.href = liveHref; publicLink.target = "_blank"; publicLink.rel = "noopener noreferrer"; toolbar.append(publicLink);
-    }
-    if (writeEnabled && item.can_trash) {
-      const trash = el("button", "button button-danger button-compact", "Move to Trash");
-      trash.type = "button";
-      trash.addEventListener("click", () => trashCurrentRecord(trash));
-      toolbar.append(trash);
-    }
-    if (liveNote) toolbar.append(el("p", "review-live-note", liveNote));
+    if (writeEnabled) actions.append(makeTrashButton(item));
+    const note = liveNote || trashReason(item);
+    if (note) actions.append(el("p", "review-live-note", note));
+    toolbar.append(decisions, actions);
   }
   function renderReviewBody(item) {
     qs("#detail-title").textContent = item.title || item.file_name || "Untitled";
@@ -399,6 +435,36 @@
     findingText.append(el("strong", "", item.recommendation), el("p", "", item.reasons.join(" ")));
     finding.append(badge(item.classification), findingText); content.append(finding);
     if (item.expected_development) finding.append(badge("expected-development"));
+    const links = el("section", "review-links");
+    const liveHref = safeLink(item.live_link);
+    const exportHref = safeLink(item.url);
+    const adminHref = safeLink(item.wp_admin_url);
+    function appendLinkRow(label, href, emptyText) {
+      const row = el("div", "review-link-row");
+      row.append(el("strong", "", label));
+      if (href) {
+        const link = el("a", "detail-link", href);
+        link.href = href; link.target = "_blank"; link.rel = "noopener noreferrer";
+        row.append(link);
+      } else {
+        row.append(el("span", "muted", emptyText));
+      }
+      links.append(row);
+    }
+    appendLinkRow(
+      item.live_link ? "Live page on the site" : "Public URL from the export",
+      liveHref || exportHref,
+      "No public URL is available for this record.",
+    );
+    appendLinkRow(
+      "WordPress admin editor",
+      adminHref,
+      "No wp-admin edit URL is available.",
+    );
+    if (exportHref && liveHref && exportHref !== liveHref) {
+      appendLinkRow("URL stored in the export", exportHref, "");
+    }
+    content.append(links);
     const details = el("dl", "detail-grid");
     detailField(details, "Content type", `${item.group_label} · ${humanize(item.content_class)}`);
     detailField(details, "Status", humanize(item.status));
@@ -452,11 +518,6 @@
         const group = el("div"); group.append(el("strong", "", taxonomyLabels[key] || humanize(key)), el("span", "", values.join(", "))); list.append(group);
       });
       content.append(list);
-    }
-    if (item.url) {
-      const href = safeLink(item.url), link = href ? el("a", "detail-link", item.url) : el("span", "detail-link", item.url);
-      if (href) { link.href = href; link.target = "_blank"; link.rel = "noopener noreferrer"; }
-      content.append(el("h3", "detail-section-title", "Exported URL"), link);
     }
     content.append(el("h3", "detail-section-title", `Where-used evidence (${item.evidence.length})`));
     if (!item.evidence.length) content.append(el("p", "muted", "No inbound evidence appears in the site export."));
