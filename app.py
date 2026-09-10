@@ -5,18 +5,21 @@ import io
 import json
 import os
 import secrets
+import time
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from time import perf_counter
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 from defusedxml.common import DefusedXmlException
-from flask import Flask, Response, jsonify, render_template, request, session
+from flask import Flask, Response, jsonify, redirect, render_template, request, session, url_for
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from analyzer import analyze_export, parse_wxr
 from analyzer.ids import LOOPBACK_HOSTS, is_loopback_address, sites_are_same, wordpress_id
 from analyzer.wp_rest import MAX_TRASH_BATCH, client_from_env, live_check_items, rest_base_for, trash_items
+from app_auth import load_users, make_dummy_hash, verify_credentials
 from audit_store import AuditStore, RevisionConflict
 from local_env import load_local_env, rest_enabled, rest_write_enabled
 
@@ -25,6 +28,9 @@ MAX_UPLOAD_BYTES = 250 * 1024 * 1024
 MAX_PAGE_SIZE = 200
 UPLOAD_CHUNK_BYTES = 3 * 1024 * 1024
 MAX_UPLOAD_CHUNKS = (MAX_UPLOAD_BYTES + UPLOAD_CHUNK_BYTES - 1) // UPLOAD_CHUNK_BYTES
+AUDIT_TTL_SECONDS = 48 * 60 * 60
+LOGIN_WINDOW_SECONDS = 15 * 60
+MAX_LOGIN_FAILURES = 5
 REVIEW_DECISIONS = {"unreviewed", "keep", "expected", "verify", "candidate", "approved"}
 FINDING_PRIORITY = {
     "unreferenced": 0,
@@ -73,7 +79,11 @@ def create_app() -> Flask:
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Strict",
         SESSION_COOKIE_SECURE=bool(os.environ.get("VERCEL")),
+        PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
     )
+    app_users = load_users(os.environ.get("APP_AUTH_USERS_JSON", ""))
+    dummy_password_hash = make_dummy_hash()
+    app.extensions["app_users"] = app_users
     audit_store = AuditStore()
     app.extensions["audit_store"] = audit_store
 
@@ -83,6 +93,8 @@ def create_app() -> Flask:
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "same-origin"
         response.headers["X-Frame-Options"] = "DENY"
+        if os.environ.get("VERCEL"):
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; img-src 'self' https: data:; style-src 'self'; "
             "script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; "
@@ -97,14 +109,72 @@ def create_app() -> Flask:
             session["write_csrf"] = token
         return token
 
+    def auth_enforced() -> bool:
+        return not (
+            app.config.get("TESTING")
+            and os.environ.get("APP_AUTH_ALLOW_IN_TESTS", "") != "1"
+        )
+
+    def current_user_email() -> str:
+        email = str(session.get("user_email") or "").casefold()
+        return email if email in app_users else ""
+
+    def request_csrf_token() -> str:
+        supplied = request.headers.get("X-CSRF-Token") or request.form.get("csrf")
+        if supplied is None and request.is_json:
+            supplied = (request.get_json(silent=True) or {}).get("csrf")
+        return str(supplied or "")
+
+    def authentication_response(status: int = 401):
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "Sign in is required."}), status
+        return redirect(url_for("login"))
+
     @app.before_request
-    def ensure_write_csrf():
+    def protect_request():
         write_csrf_token()
+        if request.endpoint == "static":
+            return None
+        if request.endpoint == "login":
+            if request.method == "POST" and not secrets.compare_digest(
+                request_csrf_token(), str(session.get("write_csrf") or "")
+            ):
+                return render_template(
+                    "login.html", csrf=write_csrf_token(), error="Refresh the page and sign in again.",
+                    configuration_error="" if app_users else "No application users are configured.",
+                ), 403
+            return None
+        if not auth_enforced():
+            return None
+        if not app_users:
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "Application sign-in is not configured."}), 503
+            return redirect(url_for("login"))
+        if not current_user_email():
+            return authentication_response()
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not secrets.compare_digest(
+            request_csrf_token(), str(session.get("write_csrf") or "")
+        ):
+            return jsonify({"error": "Refresh the page and try again."}), 403
+        return None
 
     def write_request_allowed() -> bool:
+        origin = request.headers.get("Origin")
+        if os.environ.get("VERCEL"):
+            if not current_user_email() or not origin:
+                return False
+            try:
+                parsed_origin = urlsplit(origin)
+            except ValueError:
+                return False
+            if parsed_origin.scheme.casefold() != "https" or parsed_origin.netloc.casefold() != request.host.casefold():
+                return False
+            fetch_site = request.headers.get("Sec-Fetch-Site", "").strip().casefold()
+            if fetch_site and fetch_site != "same-origin":
+                return False
+            return True
         if not is_loopback_address(request.remote_addr or ""):
             return False
-        origin = request.headers.get("Origin")
         if origin is not None:
             if origin.strip().casefold() in {"", "null"}:
                 return False
@@ -138,7 +208,18 @@ def create_app() -> Flask:
         }
 
     def latest_state():
-        return audit_store.load_state(session.get("audit_id"))
+        audit_id = session.get("audit_id")
+        state = audit_store.load_state(audit_id)
+        if not state:
+            return None
+        if auth_enforced() and state.get("owner_email") != current_user_email():
+            session.pop("audit_id", None)
+            return None
+        if state.get("expires_at") and float(state["expires_at"]) < time.time():
+            audit_store.delete_audit(audit_id)
+            session.pop("audit_id", None)
+            return None
+        return state
 
     def export_site_url(site: dict) -> str:
         """Use the WordPress installation URL; fall back to home only when absent."""
@@ -168,12 +249,37 @@ def create_app() -> Flask:
             and live_title.casefold() == export_title.casefold()
         )
 
+    def record_trash_results(audit_id: str, site_url: str, items: list[dict], results: list[dict]) -> None:
+        by_id = {str(item.get("id") or ""): item for item in items}
+        attempted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        for result in results:
+            item = by_id.get(str(result.get("id") or ""), {})
+            event = {
+                "attempted_at": attempted_at,
+                "user_email": current_user_email(),
+                "audit_id": audit_id,
+                "site_url": site_url,
+                "wordpress_id": str(result.get("id") or ""),
+                "post_type": str(item.get("type") or ""),
+                "export_status": str(item.get("status") or ""),
+                "ok": bool(result.get("ok")),
+                "error": str(result.get("error") or ""),
+            }
+            try:
+                audit_store.record_action(uuid4().hex, event)
+            except Exception:
+                app.logger.exception("WordPress Trash action could not be recorded")
+
     def analyze_and_store(stream, filename: str, audit_id: str) -> dict:
         started = perf_counter()
         export = parse_wxr(stream)
         report = analyze_export(export, _expected_author_aliases())
         report["analysis_seconds"] = round(perf_counter() - started, 2)
-        audit_store.save_report(audit_id, report, filename)
+        audit_store.save_report(
+            audit_id, report, filename,
+            owner_email=current_user_email(),
+            expires_at=time.time() + AUDIT_TTL_SECONDS,
+        )
         session["audit_id"] = audit_id
         return report
 
@@ -315,10 +421,55 @@ def create_app() -> Flask:
         payload = {
             "storage_mode": audit_store.mode,
             "chunk_size": UPLOAD_CHUNK_BYTES,
+            "current_user_email": current_user_email(),
             **rest_context(),
         }
         payload.update(extra)
         return payload
+
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        configuration_error = "" if app_users else "No application users are configured."
+        if request.method == "GET":
+            if current_user_email():
+                return redirect(url_for("index"))
+            return render_template(
+                "login.html", csrf=write_csrf_token(), error="", configuration_error=configuration_error,
+            ), 503 if configuration_error else 200
+
+        now = time.time()
+        window_started = float(session.get("login_window_started") or now)
+        failures = int(session.get("login_failures") or 0)
+        if now - window_started > LOGIN_WINDOW_SECONDS:
+            window_started, failures = now, 0
+        if failures >= MAX_LOGIN_FAILURES:
+            return render_template(
+                "login.html", csrf=write_csrf_token(),
+                error="Too many sign-in attempts. Wait 15 minutes and try again.",
+                configuration_error=configuration_error,
+            ), 429
+        email = request.form.get("email", "")
+        password = request.form.get("password", "")
+        authenticated_email = verify_credentials(app_users, email, password, dummy_password_hash)
+        if not authenticated_email:
+            session["login_window_started"] = window_started
+            session["login_failures"] = failures + 1
+            return render_template(
+                "login.html", csrf=write_csrf_token(),
+                error="The email address or password was not accepted.",
+                configuration_error=configuration_error,
+            ), 401
+        session.clear()
+        session.permanent = True
+        session["user_email"] = authenticated_email
+        session["authenticated_at"] = int(now)
+        write_csrf_token()
+        return redirect(url_for("index"))
+
+    @app.post("/logout")
+    def logout():
+        session.clear()
+        return redirect(url_for("login"))
 
     @app.route("/", methods=["GET", "POST"])
     def index():
@@ -399,13 +550,19 @@ def create_app() -> Flask:
         session["pending_upload"] = {
             "id": upload_id, "filename": filename, "size": size,
             "total_chunks": total_chunks, "previous_audit_id": session.get("audit_id"),
+            "owner_email": current_user_email(),
         }
         return jsonify({"upload_id": upload_id, "chunk_size": UPLOAD_CHUNK_BYTES})
 
     @app.post("/api/upload-chunk/<int:index>")
     def api_upload_chunk(index: int):
         pending = session.get("pending_upload") or {}
-        if not pending or index < 0 or index >= pending.get("total_chunks", 0):
+        if (
+            not pending
+            or (auth_enforced() and pending.get("owner_email") != current_user_email())
+            or index < 0
+            or index >= pending.get("total_chunks", 0)
+        ):
             return jsonify({"error": "Upload session is missing or the chunk index is invalid."}), 400
         payload = request.get_data(cache=False)
         if not payload or len(payload) > UPLOAD_CHUNK_BYTES:
@@ -418,7 +575,7 @@ def create_app() -> Flask:
     @app.post("/api/complete-upload")
     def api_complete_upload():
         pending = session.get("pending_upload") or {}
-        if not pending:
+        if not pending or (auth_enforced() and pending.get("owner_email") != current_user_email()):
             return jsonify({"error": "Upload session is missing or expired."}), 400
         upload_id = pending["id"]
         try:
@@ -453,14 +610,18 @@ def create_app() -> Flask:
 
     @app.delete("/api/audit")
     def api_delete_audit():
+        audit_id = session.get("audit_id")
+        if audit_id and auth_enforced() and latest_state() is None:
+            return jsonify({"error": "This audit is unavailable."}), 404
         pending = session.get("pending_upload") or {}
         if pending.get("id"):
             try:
                 audit_store.delete_chunks(pending["id"], pending.get("total_chunks", 0))
             except Exception:
                 app.logger.exception("Pending upload chunks could not be removed")
-        audit_store.delete_audit(session.get("audit_id"))
-        session.clear()
+        audit_store.delete_audit(audit_id)
+        session.pop("audit_id", None)
+        session.pop("pending_upload", None)
         return jsonify({"ok": True})
 
     @app.get("/api/items")
@@ -557,7 +718,7 @@ def create_app() -> Flask:
     @app.post("/api/live-check")
     def api_live_check():
         if not rest_available():
-            return jsonify({"error": "Local WordPress REST is not configured."}), 403
+            return jsonify({"error": "WordPress REST is not configured."}), 403
         state = latest_state()
         if not state:
             return jsonify({"error": "No export has been analyzed."}), 404
@@ -579,7 +740,7 @@ def create_app() -> Flask:
         site = state["report"].get("site") or {}
         rest_url = os.environ.get("WP_REST_BASE_URL", "")
         if not export_matches_rest(site, rest_url):
-            return jsonify({"error": "This export is not from the WordPress site configured for local REST."}), 409
+            return jsonify({"error": "This export is not from the WordPress site configured for REST."}), 409
         items = [
             row for row in state["report"]["items"]
             if (not group or row["group"] == group) and (not wanted or row["id"] in wanted)
@@ -611,9 +772,9 @@ def create_app() -> Flask:
     @app.post("/api/trash")
     def api_trash():
         if not write_available():
-            return jsonify({"error": "Local WordPress Trash is not enabled. Set WP_REST_WRITE_ENABLED=1 in .env.local."}), 403
+            return jsonify({"error": "WordPress Trash is not enabled for this environment."}), 403
         if not write_request_allowed():
-            return jsonify({"error": "WordPress Trash is only available from this machine."}), 403
+            return jsonify({"error": "WordPress Trash requires an authenticated same-origin request."}), 403
         state = latest_state()
         if not state:
             return jsonify({"error": "No export has been analyzed."}), 404
@@ -643,7 +804,7 @@ def create_app() -> Flask:
         site_url = export_site_url(site)
         rest_url = os.environ.get("WP_REST_BASE_URL", "")
         if not export_matches_rest(site, rest_url):
-            return jsonify({"error": "This export is not from the WordPress site configured for local REST writes."}), 409
+            return jsonify({"error": "This export is not from the WordPress site configured for REST writes."}), 409
         not_ready = [
             item_id for item_id in ids
             if not live_identity_matches(by_id[item_id], state["live"].get(item_id) or {})
@@ -672,6 +833,7 @@ def create_app() -> Flask:
         except Exception:
             app.logger.exception("WordPress REST trash failed")
             return jsonify({"error": "Moving records to WordPress Trash failed."}), 500
+        record_trash_results(session["audit_id"], site_url, items, results)
         live = dict(state["live"])
         for result in results:
             if result.get("ok") and result.get("live"):

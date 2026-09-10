@@ -32,7 +32,7 @@
     catch { return ""; }
   };
   function trashReason(item) {
-    if (!writeEnabled) return "Local WordPress Trash is not enabled.";
+    if (!writeEnabled) return "WordPress Trash is not enabled for this environment.";
     if (item.live_checking) return "Wait for the fresh WordPress check to finish.";
     if (item.can_trash) return "";
     if (item.live_state === "unchecked") return "Live-check this record first, then mark Candidate or Approved.";
@@ -90,6 +90,7 @@
   const chunkSize = Number(runtime.chunk_size) || (3 * 1024 * 1024);
   const restEnabled = Boolean(runtime.rest_enabled);
   const writeEnabled = Boolean(runtime.rest_write_enabled);
+  const csrfHeaders = (headers = {}) => ({ ...headers, "X-CSRF-Token": runtime.write_csrf || "" });
   const review = { ids: [], index: 0, total: 0, open: false, item: null, seq: 0, filterKey: "" };
 
   function uploadError(form, message) {
@@ -115,21 +116,21 @@
     try {
       const totalChunks = Math.ceil(file.size / chunkSize);
       await responseJson(await fetch("/api/upload-session", {
-        method: "POST", headers: { "Content-Type": "application/json" },
+        method: "POST", headers: csrfHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ filename: file.name, size: file.size, total_chunks: totalChunks }),
       }));
       for (let index = 0; index < totalChunks; index += 1) {
         const start = index * chunkSize, end = Math.min(start + chunkSize, file.size);
         detail.textContent = `Securely uploading part ${index + 1} of ${totalChunks}…`;
         await responseJson(await fetch(`/api/upload-chunk/${index}`, {
-          method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: file.slice(start, end),
+          method: "POST", headers: csrfHeaders({ "Content-Type": "application/octet-stream" }), body: file.slice(start, end),
         }));
         progress.value = Math.round(((index + 1) / totalChunks) * 75);
       }
       label.textContent = "Analyzing the WordPress export";
       detail.textContent = "Building the inventory, taxonomies, and reference graph…";
       progress.value = 82;
-      const completed = await responseJson(await fetch("/api/complete-upload", { method: "POST" }));
+      const completed = await responseJson(await fetch("/api/complete-upload", { method: "POST", headers: csrfHeaders() }));
       progress.value = 100;
       detail.textContent = `${completed.records.toLocaleString()} records analyzed. Opening the dashboard…`;
       window.location.assign(completed.redirect || "/");
@@ -260,7 +261,7 @@
     if (!confirmed) return false;
     const payload = await responseJson(await fetch("/api/trash", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: csrfHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ ids, confirm: "trash", csrf: runtime.write_csrf || "" }),
     }));
     payload.results.filter((result) => result.ok).forEach((result) => selected.delete(result.id));
@@ -300,7 +301,7 @@
     select.addEventListener("change", async () => {
       const prior = select.dataset.state; select.disabled = true;
       try {
-        const response = await fetch(`/api/items/${encodeURIComponent(item.id)}/decision`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ decision: select.value }) });
+        const response = await fetch(`/api/items/${encodeURIComponent(item.id)}/decision`, { method: "POST", headers: csrfHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ decision: select.value }) });
         if (!response.ok) throw new Error("The review decision could not be saved.");
         select.dataset.state = select.value; select.classList.add("is-saved"); setTimeout(() => select.classList.remove("is-saved"), 900);
       } catch (error) { select.value = prior; window.alert(error.message); }
@@ -445,7 +446,7 @@
       const complete = el("section", "review-complete");
       complete.append(el("strong", "", "This record is in WordPress Trash."), el("p", "", "The move was reversible; restoration remains a WordPress admin action."));
       content.append(complete);
-    } else {
+    } else if (restEnabled || writeEnabled) {
       const readiness = el("section", "review-readiness");
       readiness.append(el("h3", "", "Trash readiness"));
       const checks = el("div", "review-checklist");
@@ -456,7 +457,7 @@
         if (detail) copy.append(el("small", "", detail));
         row.append(copy); checks.append(row);
       };
-      addCheck(restEnabled, "Local WordPress REST", restEnabled ? "Configured for this review session." : "Configure local REST to check and trash records.");
+      addCheck(restEnabled, "WordPress REST", restEnabled ? "Configured for this review session." : "Configure WordPress REST to check and trash records.");
       addCheck(item.live_state === "found" && !item.live_checking, "Found on live WordPress", item.live_checking ? "Refreshing now…" : humanize(item.live_state || "unchecked"));
       addCheck(Boolean(item.live_snapshot_ready) && !item.live_checking, "Fresh version snapshot", item.live_modified ? `Modified ${item.live_modified}` : "A version timestamp is required.");
       addCheck(Boolean(item.live_identity_matches) && !item.live_checking, "Identity matches export", item.live_title ? `Live title: ${item.live_title}` : "WordPress did not return a title.");
@@ -613,7 +614,7 @@
     renderReviewToolbar(review.item, "Checking live WordPress for this record…");
     try {
       await responseJson(await fetch("/api/live-check", {
-        method: "POST", headers: { "Content-Type": "application/json" },
+        method: "POST", headers: csrfHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ ids: [id] }),
       }));
       if (seq !== review.seq) return;
@@ -632,7 +633,7 @@
     if (!item) return;
     try {
       await responseJson(await fetch(`/api/items/${encodeURIComponent(item.id)}/decision`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
+        method: "POST", headers: csrfHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ decision }),
       }));
       await refreshCurrentItem();
@@ -748,7 +749,7 @@
   qs("#new-analysis").addEventListener("click", () => { const details = qs("#replace-export"); details.open = true; details.scrollIntoView({ behavior: "smooth", block: "center" }); });
   qs("#delete-audit")?.addEventListener("click", async () => {
     if (!window.confirm("Remove this audit report and its review decisions from storage?")) return;
-    const response = await fetch("/api/audit", { method: "DELETE" });
+    const response = await fetch("/api/audit", { method: "DELETE", headers: csrfHeaders() });
     if (response.ok) window.location.assign("/");
     else window.alert("The stored audit could not be removed.");
   });

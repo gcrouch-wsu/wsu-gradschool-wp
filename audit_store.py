@@ -29,6 +29,7 @@ class AuditStore:
         self._live: dict[str, dict[str, dict]] = {}
         self._decision_revs: dict[str, int] = {}
         self._live_revs: dict[str, int] = {}
+        self._actions: list[dict[str, Any]] = []
         self._lock = RLock()
 
     @property
@@ -133,8 +134,21 @@ class AuditStore:
                 self._chunks.pop(key, None)
                 self._chunk_times.pop(key, None)
 
-    def save_report(self, audit_id: str, report: dict, filename: str) -> None:
-        state = {"report": report, "filename": filename}
+    def save_report(
+        self,
+        audit_id: str,
+        report: dict,
+        filename: str,
+        owner_email: str = "",
+        expires_at: float | None = None,
+    ) -> None:
+        state = {
+            "report": report,
+            "filename": filename,
+            "owner_email": owner_email,
+            "created_at": time.time(),
+            "expires_at": expires_at,
+        }
         self._cache_report(audit_id, state)
         if self.blob_enabled:
             raw = json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -147,6 +161,23 @@ class AuditStore:
                 )
         self.save_decisions(audit_id, {})
         self.save_live(audit_id, {})
+
+    def record_action(self, event_id: str, event: dict[str, Any]) -> None:
+        """Write one immutable, metadata-only audit event."""
+        payload = dict(event)
+        payload["event_id"] = event_id
+        if self.blob_enabled:
+            day = str(payload.get("attempted_at") or "unknown")[:10]
+            path = f"audit-actions/{day}/{event_id}.json"
+            with self._client() as client:
+                client.put(
+                    path,
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+                    access="private", content_type="application/json", overwrite=False,
+                )
+            return
+        with self._lock:
+            self._actions.append(payload)
 
     def load_report(self, audit_id: str) -> dict[str, Any] | None:
         with self._lock:

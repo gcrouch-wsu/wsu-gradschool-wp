@@ -17,9 +17,13 @@
       </a>
       <div class="header-meta">
         <span class="privacy-chip"><i aria-hidden="true"></i>{{ 'Private audit storage' if storage_mode == 'blob' else 'Local memory' }}</span>
-        {% if rest_write_enabled %}<span class="privacy-chip"><i aria-hidden="true"></i>Local REST can trash</span>
-        {% elif rest_enabled %}<span class="privacy-chip"><i aria-hidden="true"></i>Local REST read-only</span>{% endif %}
+        {% if rest_write_enabled %}<span class="privacy-chip"><i aria-hidden="true"></i>WordPress Trash enabled</span>
+        {% elif rest_enabled %}<span class="privacy-chip"><i aria-hidden="true"></i>WordPress REST read-only</span>{% endif %}
         {% if report %}<button class="button button-ghost" id="new-analysis" type="button">New export</button>{% endif %}
+        {% if current_user_email %}
+          <span class="signed-in-user">{{ current_user_email }}</span>
+          <form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf" value="{{ write_csrf }}"><button class="button button-ghost" type="submit">Sign out</button></form>
+        {% endif %}
       </div>
     </div>
   </header>
@@ -33,9 +37,9 @@
           <p>Turn a WordPress site export into a structured inventory of pages, posts, events, media, documents, tables, forms, and their relationships.</p>
           <ul class="assurance-list">
             {% if rest_write_enabled %}
-              <li>Trash in WordPress is local-only, confirmed, and reversible</li>
+              <li>Trash in WordPress is authenticated, confirmed, and reversible</li>
             {% elif rest_enabled %}
-              <li>Live checks are local and read-only</li>
+              <li>Live checks are enabled and read-only</li>
             {% else %}
               <li>Nothing is written to WordPress</li>
             {% endif %}
@@ -56,6 +60,7 @@
             <div class="alert alert-error" role="alert"><strong>Analysis stopped</strong><span>{{ error }}</span></div>
           {% endif %}
           <form class="upload-form" method="post" enctype="multipart/form-data">
+            <input type="hidden" name="csrf" value="{{ write_csrf }}">
             <label class="file-drop" for="file-input">
               <span class="file-icon" aria-hidden="true">XML</span>
               <span><strong id="file-label">Choose or drop an XML export</strong><small>Maximum file size: 250 MB</small></span>
@@ -190,9 +195,9 @@
                 <article class="coverage-row"><span class="coverage-status {{ 'is-available' if source['available'] else 'is-missing' }}" aria-hidden="true">{{ '✓' if source['available'] else '—' }}</span><div><strong>{{ source['source'] }}</strong><p>{{ source['detail'] }}</p></div><span class="coverage-label">{{ 'Included' if source['available'] else 'Unavailable' }}</span></article>
               {% endfor %}
               {% if rest_write_enabled %}
-                <article class="coverage-row"><span class="coverage-status is-available" aria-hidden="true">✓</span><div><strong>WordPress REST (local, Trash enabled)</strong><p>Optional live exists/status check and confirmed Move to Trash. Permanent delete is never sent. This is not available on Vercel.</p></div><span class="coverage-label">Configured</span></article>
+                <article class="coverage-row"><span class="coverage-status is-available" aria-hidden="true">✓</span><div><strong>WordPress REST (Trash enabled)</strong><p>Live exists/status check and confirmed Move to Trash. Permanent delete is never sent.</p></div><span class="coverage-label">Configured</span></article>
               {% elif rest_enabled %}
-                <article class="coverage-row"><span class="coverage-status is-available" aria-hidden="true">✓</span><div><strong>WordPress REST (local, read-only)</strong><p>Optional live exists/status check using an Application Password. Nothing is written to WordPress.</p></div><span class="coverage-label">Configured</span></article>
+                <article class="coverage-row"><span class="coverage-status is-available" aria-hidden="true">✓</span><div><strong>WordPress REST (read-only)</strong><p>Live exists/status check using an Application Password. Nothing is written to WordPress.</p></div><span class="coverage-label">Configured</span></article>
               {% endif %}
             </div>
           </section>
@@ -201,7 +206,8 @@
         <details class="replace-export" id="replace-export">
           <summary>Analyze a different export</summary>
           <form class="upload-form compact" method="post" enctype="multipart/form-data">
-            <label class="file-drop" for="replacement-file"><span class="file-icon" aria-hidden="true">XML</span><span><strong id="replacement-label">Choose another XML export</strong><small>It will replace the current in-memory report.</small></span><input id="replacement-file" name="export_file" type="file" accept=".xml,text/xml,application/xml" required></label>
+            <input type="hidden" name="csrf" value="{{ write_csrf }}">
+            <label class="file-drop" for="replacement-file"><span class="file-icon" aria-hidden="true">XML</span><span><strong id="replacement-label">Choose another XML export</strong><small>It will replace your current audit.</small></span><input id="replacement-file" name="export_file" type="file" accept=".xml,text/xml,application/xml" required></label>
             <button class="button button-primary" type="submit">Analyze replacement</button>
           </form>
           <button class="button button-danger" id="delete-audit" type="button">Remove this stored audit</button>

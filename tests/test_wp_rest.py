@@ -312,3 +312,39 @@ def test_trash_reports_remaining_items_when_wordpress_refuses_auth():
     )
     assert len(results) == 2
     assert all(not result["ok"] for result in results)
+
+
+def test_trash_confirms_state_after_an_uncertain_delete_response():
+    reads = 0
+    deletes = 0
+
+    def fake_get(url, headers, timeout):
+        nonlocal reads
+        reads += 1
+        return 200, {
+            "id": 3,
+            "status": "publish" if reads == 1 else "trash",
+            "type": "page",
+            "title": {"rendered": "Development page"},
+            "link": "https://example.test/dev",
+            "modified": "2026-01-02T00:00:00",
+        }
+
+    def fake_delete(url, headers, timeout):
+        nonlocal deletes
+        deletes += 1
+        raise TimeoutError("response timed out")
+
+    client = WordPressRestClient(
+        "https://example.test", "gcrouch", "secret", http_get=fake_get, http_delete=fake_delete
+    )
+    results = trash_items(
+        [{"id": "3", "type": "page", "title": "Development page"}],
+        client,
+        site_url="https://example.test",
+    )
+    assert deletes == 1
+    assert reads == 2
+    assert results[0]["ok"] is True
+    assert results[0]["live"]["live_state"] == "trashed"
+    assert "uncertain" in results[0]["notice"]

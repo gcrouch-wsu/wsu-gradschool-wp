@@ -2,9 +2,9 @@
 
 ## Purpose
 
-Build a local, evidence-based review tool that analyzes a WordPress WXR export and helps Graduate School site maintainers identify pages, posts, documents, media, and plugin content that may no longer be needed.
+Build a private, evidence-based review tool that analyzes a fresh WordPress WXR export and lets one authorized Graduate School site maintainer at a time review records and move confirmed records to WordPress Trash.
 
-The application supports human decisions and, locally, confirmed WordPress Trash. It does not automatically label anything safe to delete, and it never force-deletes. Its central question is: **What evidence connects this record to the rest of the site, and what evidence is missing?**
+The application supports human decisions and confirmed WordPress Trash locally or from the production Vercel deployment. It does not automatically label anything safe to delete, and it never force-deletes. Its central question is: **What evidence connects this record to the rest of the site, and what evidence is missing?**
 
 For local development, the latest analysis and review decisions live only in process memory. On Vercel, the same workflow uses private Blob-backed audit sessions so requests can move between function instances. Raw XML chunks are removed after analysis, and an audit can be explicitly removed from the interface.
 
@@ -20,8 +20,9 @@ The working application now:
 - Extracts references from content, excerpts, menus, parent relationships, featured images, attachment relationships, Gutenberg/block markup, shortcodes, and useful custom fields.
 - Separates strong, possible, and structural references and retains where-used evidence.
 - Identifies expected development content using configurable Greg Crouch author aliases without replacing the underlying finding.
-- Provides server-side search, filters, pagination, taxonomy drill-down, record details, in-memory review decisions, a cross-group work queue, and filtered CSV/JSON exports.
-- Locally, refreshes an opened review record from live WordPress REST and can move selected records to Trash after confirmation. Trash uses WordPress `DELETE` without `force`, requires a complete fresh live snapshot plus candidate/approved review, rejects version drift, and is loopback- and CSRF-gated.
+- Provides server-side search, filters, pagination, taxonomy drill-down, record details, per-audit review decisions, a cross-group work queue, and filtered CSV/JSON exports.
+- Requires an exact configured WSU email and app-specific password; each audit is bound to its signed-in reviewer.
+- Refreshes an opened review record from live WordPress REST and can move one record from the review sheet or up to 25 selected records to Trash after confirmation. Trash uses WordPress `DELETE` without `force`, requires a complete fresh live snapshot plus candidate/approved review, rejects version drift, and is authentication-, CSRF-, site-, and origin-gated.
 - Marks published Events Calendar and graduate factsheet records as needing verification from an assumed public archive; it does not treat that archive as proven reachability.
 - Escapes displayed content and protects CSV cells from spreadsheet formula injection.
 
@@ -77,12 +78,12 @@ The intended workflow is:
 
 1. Select a content group.
 2. Filter by finding, status, author, subtype, taxonomy term, or search text.
-3. Open the review sheet; when local REST is configured, it refreshes the record and compares the export with live identity and version fields.
+3. Open the review sheet; when REST is configured, it refreshes the record and compares the export with live identity and version fields.
 4. Assign a review decision: Keep, Expected Development, Verify, Deletion Candidate, or Approved to Delete.
 5. For Candidate or Approved records with a complete matching live snapshot, confirm Move to Trash directly in the review sheet.
 6. Export the current filtered view to CSV or JSON, or use the work queue to review unreferenced records, live-missing records, and deletion candidates.
 
-Locally, with `WP_REST_WRITE_ENABLED=1`, the app can move selected records to WordPress Trash after an explicit confirmation. It never force-deletes. Restore remains a WordPress admin action.
+With REST write access explicitly enabled, the app can move selected records to WordPress Trash after an explicit confirmation. Vercel additionally requires the Production environment and `WP_REST_REMOTE_WRITE_ENABLED=1`; Preview stays read-only. It never force-deletes. Restore remains a WordPress admin action.
 
 ## What a WXR export can and cannot prove
 
@@ -94,9 +95,10 @@ Consequently, “unreferenced in export” means exactly that. It is not equival
 
 ## Safety and privacy requirements
 
-- Stay local-only for WordPress REST credentials and writes. Never put `WP_REST_*` on Vercel.
-- Trash is opt-in (`WP_REST_WRITE_ENABLED`), confirmed in the UI, and never uses WordPress `force` delete.
-- Keep uploaded data and review decisions local and in memory for the current local-dev phase. On Vercel, reports use private Blob storage; abandoned upload chunks expire after one hour when a later upload refreshes the chunk index.
+- Keep WordPress credentials server-side. On Vercel they are Production-only secrets, with Preview writes disabled and an additional remote-write flag.
+- Trash is opt-in (`WP_REST_WRITE_ENABLED`, plus `WP_REST_REMOTE_WRITE_ENABLED` on Vercel), confirmed in the UI, capped at 25 records, and never uses WordPress `force` delete.
+- Require application sign-in, an exact WSU email allowlist, CSRF protection, a same-origin production request, and a fresh matching live snapshot before Trash.
+- Keep local development data in memory. On Vercel, reports use private Blob storage; completed raw XML chunks are deleted, and abandoned chunks expire after one hour when a later upload refreshes the chunk index.
 - Parse XML with protections appropriate for untrusted uploads.
 - Preserve original evidence while normalizing URLs for matching.
 - Escape uploaded values in the interface.
@@ -113,9 +115,11 @@ wsu-gradschool-wp/
     wxr_parser.py           protected WXR parsing
     url_normalizer.py       URL matching variants
     analysis.py             extraction, graph, classification, grouping
-    wp_rest.py              local live-check and Trash client
-  local_env.py              local .env.local loader; Vercel never loads it
-  templates/index.html      dashboard and upload workflow
+    wp_rest.py              live-check and Trash client
+  app_auth.py               exact-email application authentication
+  local_env.py              .env.local loader and environment safety gates
+  templates/index.html      dashboard and upload/review workflow
+  templates/login.html      private reviewer sign-in
   public/app.js             interactive filtering and chunked upload workflow
   public/styles.css         responsive WSU-oriented visual system
   audit_store.py            memory/private-Blob storage adapter
@@ -137,19 +141,19 @@ The analyzer is independent of Flask so it can be tested directly and later reus
 
 ### Phase 3 — Optional live confirmation
 
-Local REST live-check and confirmed Trash are already implemented. Remaining work:
+REST live-check and confirmed Trash are already implemented. Remaining work:
 
 - Add an explicitly enabled, read-only crawl of the public site.
 - Compare live status codes, redirects, canonical URLs, links, embeds, and asset use with export findings.
 - Keep sitemap presence separate from genuine reachability.
-- Never submit forms from a crawler. REST writes stay local, opt-in, Trash-only, and never use `force`.
+- Never submit forms from a crawler. REST writes stay opt-in, Trash-only, and never use `force`.
 
 ### Phase 4 — Persistence and governance
 
 - Persist analysis runs and review decisions in a local database.
 - Record reviewer, timestamp, notes, and decision history.
 - Support comparison between exports to show additions, removals, and changed evidence.
-- Produce an approved action list that can be executed through the existing local Trash path or a separate controlled WordPress cleanup process.
+- Produce an approved action list that can be executed through the existing confirmed Trash path or a separate controlled WordPress cleanup process.
 
 ### Phase 5 — REST-first inventory, export as deep audit
 
@@ -157,12 +161,12 @@ A WXR export remains required for the current orphan/where-used graph. REST is a
 
 **Intended shape:** hybrid, not REST-only.
 
-1. Open the dashboard from authenticated local REST and populate inventory, live status, and Trash without an upload.
+1. Open the dashboard from authenticated REST and populate inventory and live status without an upload; keep write enablement a separate capability.
 2. Keep the export, or an equivalent authenticated content crawl, as the optional source for the reference graph: where-used evidence, unreferenced media, and disconnected islands.
 3. Weaken or disable export-only findings when no snapshot is loaded, rather than guessing from titles and IDs.
 4. Use REST for smaller groups first (posts, pages, events). Media (~3,600), documents, and forms can stay export-backed until pagination and coverage are proven.
 5. Mark groups that REST cannot cover (TablePress, Gravity Forms definitions, some Other plugin types) as partial or unavailable.
-6. Keep all WordPress credentials and writes local. Never put `WP_REST_*` on Vercel.
+6. Keep all WordPress credentials server-side, scope them to the least-privilege WordPress account, and keep Preview read-only.
 
 **Write preflight required before expanding REST-first inventory**
 

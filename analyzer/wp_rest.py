@@ -147,7 +147,7 @@ class WordPressRestClient:
         self.headers = {
             "Authorization": f"Basic {token}",
             "Accept": "application/json",
-            "User-Agent": "wsu-gradschool-wp-audit/local",
+            "User-Agent": "wsu-gradschool-wp-audit",
         }
         if not rest_base_url_allowed(base_url):
             raise ValueError("WordPress REST must use HTTPS, or HTTP only on loopback.")
@@ -365,6 +365,35 @@ def _rendered_title(payload: dict) -> str:
     return re.sub(r"<[^>]+>", "", unescape(text)).strip()
 
 
+def _confirm_trashed_after_uncertain_response(
+    client: WordPressRestClient,
+    rest_base: str,
+    item_id: str,
+    expected_type: str,
+    site_url: str,
+) -> dict | None:
+    try:
+        verify_status, verify_payload = client.get_item(rest_base, item_id)
+    except (URLError, TimeoutError, OSError, ValueError):
+        return None
+    if not (
+        verify_status == 200
+        and isinstance(verify_payload, dict)
+        and wordpress_id(verify_payload.get("id")) == item_id
+        and str(verify_payload.get("type") or "") == expected_type
+        and str(verify_payload.get("status") or "") == "trash"
+    ):
+        return None
+    live = _empty_live(item_id, rest_base, "trashed")
+    live["live_status"] = "trash"
+    live["live_type"] = expected_type
+    live["live_title"] = _rendered_title(verify_payload)
+    live["live_link"] = str(verify_payload.get("link") or "")
+    live["live_modified"] = str(verify_payload.get("modified") or "")
+    live["wp_admin_url"] = wp_admin_trash_url(site_url, expected_type)
+    return live
+
+
 def trash_items(
     items: list[dict],
     client: WordPressRestClient,
@@ -481,12 +510,46 @@ def trash_items(
         try:
             status, payload = client.trash(rest_base, item_id)
         except (URLError, TimeoutError, OSError, ValueError) as exc:
+            live = _confirm_trashed_after_uncertain_response(
+                client, rest_base, item_id, expected_type, site_url
+            )
+            if live:
+                results.append({
+                    "id": item_id,
+                    "ok": True,
+                    "title": title,
+                    "live": live,
+                    "error": "",
+                    "notice": "WordPress was re-read after an uncertain Trash response and confirmed this record is in Trash.",
+                })
+                continue
             results.append({
                 "id": item_id,
                 "ok": False,
                 "title": title,
-                "error": f"WordPress REST failed during Trash: {exc}. Local live state was not updated.",
+                "error": f"WordPress REST failed during Trash: {exc}. The record could not be confirmed in Trash.",
             })
+            continue
+        if status == 0:
+            live = _confirm_trashed_after_uncertain_response(
+                client, rest_base, item_id, expected_type, site_url
+            )
+            if live:
+                results.append({
+                    "id": item_id,
+                    "ok": True,
+                    "title": title,
+                    "live": live,
+                    "error": "",
+                    "notice": "WordPress was re-read after an uncertain Trash response and confirmed this record is in Trash.",
+                })
+            else:
+                results.append({
+                    "id": item_id,
+                    "ok": False,
+                    "title": title,
+                    "error": f"{_payload_message(payload, 'WordPress REST failed during Trash.')} The record could not be confirmed in Trash.",
+                })
             continue
         if status in {401, 403}:
             message = _payload_message(payload, "WordPress refused authenticated REST access.")

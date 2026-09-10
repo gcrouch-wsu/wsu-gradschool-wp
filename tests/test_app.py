@@ -1,4 +1,7 @@
+import json
 from io import BytesIO
+
+from werkzeug.security import generate_password_hash
 
 from app import create_app
 from tests.test_analyzer import WXR
@@ -342,3 +345,195 @@ def test_decision_write_conflicts_when_revision_changes():
         raise AssertionError("Stale revision must conflict.")
     except RevisionConflict as exc:
         assert exc.current_rev == 2
+
+
+def test_configured_users_must_sign_in_and_send_csrf(monkeypatch):
+    monkeypatch.setenv("APP_AUTH_ALLOW_IN_TESTS", "1")
+    monkeypatch.setenv("APP_AUTH_USERS_JSON", json.dumps({
+        "Reviewer@wsu.edu": generate_password_hash("correct horse battery staple"),
+    }))
+    app = create_app()
+    app.config.update(TESTING=True)
+    client = app.test_client()
+
+    assert client.get("/").status_code == 302
+    assert client.get("/api/items").status_code == 401
+    assert client.get("/login").status_code == 200
+    csrf = _write_csrf(client)
+    refused = client.post("/login", data={
+        "csrf": csrf, "email": "reviewer@wsu.edu", "password": "wrong",
+    })
+    assert refused.status_code == 401
+    accepted = client.post("/login", data={
+        "csrf": csrf, "email": "REVIEWER@WSU.EDU", "password": "correct horse battery staple",
+    })
+    assert accepted.status_code == 302
+    with client.session_transaction() as sess:
+        assert sess["user_email"] == "reviewer@wsu.edu"
+    assert client.get("/").status_code == 200
+    assert client.post(
+        "/api/upload-session",
+        json={"filename": "test.xml", "size": len(WXR), "total_chunks": 1},
+    ).status_code == 403
+    new_csrf = _write_csrf(client)
+    assert client.post(
+        "/api/upload-session",
+        json={"filename": "test.xml", "size": len(WXR), "total_chunks": 1},
+        headers={"X-CSRF-Token": new_csrf},
+    ).status_code == 200
+
+
+def test_authenticated_users_cannot_open_another_users_audit(monkeypatch):
+    monkeypatch.setenv("APP_AUTH_ALLOW_IN_TESTS", "1")
+    monkeypatch.setenv("APP_AUTH_USERS_JSON", json.dumps({
+        "first@wsu.edu": generate_password_hash("first password"),
+        "second@wsu.edu": generate_password_hash("second password"),
+    }))
+    app = create_app()
+    app.config.update(TESTING=True)
+    client = app.test_client()
+
+    client.get("/login")
+    assert client.post("/login", data={
+        "csrf": _write_csrf(client), "email": "first@wsu.edu", "password": "first password",
+    }).status_code == 302
+    uploaded = client.post(
+        "/",
+        data={"csrf": _write_csrf(client), "export_file": (BytesIO(WXR), "first.xml")},
+        content_type="multipart/form-data",
+    )
+    assert uploaded.status_code == 200
+    with client.session_transaction() as sess:
+        first_audit_id = sess["audit_id"]
+    assert client.post("/logout", data={"csrf": _write_csrf(client)}).status_code == 302
+
+    client.get("/login")
+    assert client.post("/login", data={
+        "csrf": _write_csrf(client), "email": "second@wsu.edu", "password": "second password",
+    }).status_code == 302
+    with client.session_transaction() as sess:
+        sess["audit_id"] = first_audit_id
+    assert client.get("/api/items").status_code == 404
+
+
+def test_vercel_trash_requires_production_and_explicit_remote_enable(monkeypatch):
+    from local_env import rest_enabled, rest_write_enabled
+
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.setenv("WP_REST_BASE_URL", "https://example.test")
+    monkeypatch.setenv("WP_REST_USERNAME", "audit-user")
+    monkeypatch.setenv("WP_REST_APPLICATION_PASSWORD", "application-password")
+    monkeypatch.setenv("WP_REST_ENABLED", "1")
+    monkeypatch.setenv("WP_REST_WRITE_ENABLED", "1")
+    monkeypatch.setenv("WP_REST_REMOTE_WRITE_ENABLED", "1")
+    monkeypatch.setenv("VERCEL_ENV", "preview")
+    assert rest_enabled() is True
+    assert rest_write_enabled() is False
+    monkeypatch.setenv("VERCEL_ENV", "production")
+    assert rest_write_enabled() is True
+    monkeypatch.setenv("WP_REST_REMOTE_WRITE_ENABLED", "0")
+    assert rest_write_enabled() is False
+
+
+def test_write_enabled_dashboard_renders_bulk_selection_controls(monkeypatch):
+    monkeypatch.setenv("WP_REST_ALLOW_IN_TESTS", "1")
+    monkeypatch.setenv("WP_REST_ENABLED", "1")
+    monkeypatch.setenv("WP_REST_WRITE_ENABLED", "1")
+    monkeypatch.setenv("WP_REST_BASE_URL", "https://example.test")
+    monkeypatch.setenv("WP_REST_USERNAME", "audit-user")
+    monkeypatch.setenv("WP_REST_APPLICATION_PASSWORD", "application-password")
+
+    client = _client_with_report()
+    page = client.get("/")
+    assert page.status_code == 200
+    assert b'id="select-page"' in page.data
+    assert b'id="bulk-trash"' in page.data
+    assert b"Move selected to Trash" in page.data
+    assert b'"rest_write_enabled": true' in page.data
+
+
+def test_vercel_trash_requires_authenticated_same_origin_request(monkeypatch):
+    monkeypatch.setenv("APP_AUTH_ALLOW_IN_TESTS", "1")
+    monkeypatch.setenv("APP_AUTH_USERS_JSON", json.dumps({
+        "reviewer@wsu.edu": generate_password_hash("review password"),
+    }))
+    monkeypatch.setenv("FLASK_SECRET_KEY", "test-only-secret-key-that-is-long-enough")
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.setenv("VERCEL_ENV", "production")
+    monkeypatch.setenv("WP_REST_ALLOW_IN_TESTS", "1")
+    monkeypatch.setenv("WP_REST_BASE_URL", "https://example.test")
+    monkeypatch.setenv("WP_REST_USERNAME", "audit-user")
+    monkeypatch.setenv("WP_REST_APPLICATION_PASSWORD", "application-password")
+    monkeypatch.setenv("WP_REST_ENABLED", "1")
+    monkeypatch.setenv("WP_REST_WRITE_ENABLED", "1")
+    monkeypatch.setenv("WP_REST_REMOTE_WRITE_ENABLED", "1")
+
+    app = create_app()
+    app.config.update(TESTING=True)
+    client = app.test_client()
+    client.get("/login")
+    assert client.post("/login", data={
+        "csrf": _write_csrf(client), "email": "reviewer@wsu.edu", "password": "review password",
+    }).status_code == 302
+    csrf = _write_csrf(client)
+    body = {"ids": ["3"], "confirm": "trash", "csrf": csrf}
+
+    assert client.post(
+        "/api/trash", json=body,
+        headers={"X-CSRF-Token": csrf, "Origin": "https://hostile.example"},
+    ).status_code == 403
+    assert client.post(
+        "/api/trash", json=body,
+        headers={"X-CSRF-Token": csrf, "Origin": "https://localhost", "Sec-Fetch-Site": "cross-site"},
+    ).status_code == 403
+    assert client.post(
+        "/api/trash", json=body,
+        headers={"X-CSRF-Token": csrf, "Origin": "https://localhost", "Sec-Fetch-Site": "same-origin"},
+    ).status_code == 404
+
+
+def test_successful_trash_writes_limited_action_metadata(monkeypatch):
+    recorded = []
+
+    def capture_action(_event_id, event):
+        recorded.append(event)
+
+    def fake_get(url, _headers, _timeout):
+        if "/pages?" in url:
+            return 200, [{
+                "id": 3, "status": "publish", "type": "page",
+                "title": {"rendered": "Development page"},
+                "link": "https://example.test/dev", "modified": "2026-01-02T00:00:00",
+            }], {"x-wp-total": "1", "x-wp-totalpages": "1"}
+        return 200, {
+            "id": 3, "status": "publish", "type": "page",
+            "title": {"rendered": "Development page"},
+            "link": "https://example.test/dev", "modified": "2026-01-02T00:00:00",
+        }
+
+    def fake_delete(_url, _headers, _timeout):
+        return 200, {"id": 3, "status": "trash", "type": "page"}
+
+    monkeypatch.setenv("WP_REST_ALLOW_IN_TESTS", "1")
+    monkeypatch.setenv("WP_REST_ENABLED", "1")
+    monkeypatch.setenv("WP_REST_WRITE_ENABLED", "1")
+    monkeypatch.setenv("WP_REST_BASE_URL", "https://example.test")
+    monkeypatch.setenv("WP_REST_USERNAME", "audit-user")
+    monkeypatch.setenv("WP_REST_APPLICATION_PASSWORD", "application-password")
+    monkeypatch.setattr("analyzer.wp_rest._http_get", fake_get)
+    monkeypatch.setattr("analyzer.wp_rest._http_delete", fake_delete)
+
+    client = _client_with_report()
+    store = client.application.extensions["audit_store"]
+    monkeypatch.setattr(store, "record_action", capture_action)
+    assert client.post("/api/live-check", json={"ids": ["3"]}).status_code == 200
+    assert client.post("/api/items/3/decision", json={"decision": "candidate"}).status_code == 200
+    assert client.post(
+        "/api/trash",
+        json={"ids": ["3"], "confirm": "trash", "csrf": _write_csrf(client)},
+    ).status_code == 200
+    assert len(recorded) == 1
+    assert recorded[0]["wordpress_id"] == "3"
+    assert recorded[0]["ok"] is True
+    assert "title" not in recorded[0]
+    assert "application-password" not in json.dumps(recorded[0])

@@ -38,8 +38,6 @@ def rest_credentials_configured() -> bool:
 
 
 def rest_enabled(testing: bool = False) -> bool:
-    if os.environ.get("VERCEL"):
-        return False
     if testing and os.environ.get("WP_REST_ALLOW_IN_TESTS") != "1":
         return False
     return rest_credentials_configured()
@@ -48,4 +46,12 @@ def rest_enabled(testing: bool = False) -> bool:
 def rest_write_enabled(testing: bool = False) -> bool:
     if not rest_enabled(testing=testing):
         return False
-    return os.environ.get("WP_REST_WRITE_ENABLED", "").strip().lower() in {"1", "true", "yes"}
+    write_enabled = os.environ.get("WP_REST_WRITE_ENABLED", "").strip().lower() in {"1", "true", "yes"}
+    if not write_enabled:
+        return False
+    if os.environ.get("VERCEL"):
+        return bool(
+            os.environ.get("VERCEL_ENV") == "production"
+            and os.environ.get("WP_REST_REMOTE_WRITE_ENABLED", "").strip().lower() in {"1", "true", "yes"}
+        )
+    return True
