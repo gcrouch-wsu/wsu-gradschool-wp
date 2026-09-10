@@ -327,14 +327,17 @@
       taxonomy.append(taxonomySummary(item)); published.textContent = dateOnly(item.created); updated.textContent = dateOnly(item.modified); review.append(reviewSelect(item));
       const button = el("button", "button button-detail", "Review"); button.type = "button"; button.addEventListener("click", () => openDetails(item.id)); actions.append(button);
       actions.className = "actions-cell";
-      if (writeEnabled) actions.append(makeTrashButton(item));
       if (writeEnabled) {
         const select = document.createElement("td");
+        select.className = "select-col";
         const box = el("input", "row-select");
         box.type = "checkbox";
         box.dataset.id = item.id;
+        box.dataset.title = item.title || item.file_name || `ID ${item.id}`;
+        if (selected.has(item.id) && !item.can_trash) selected.delete(item.id);
         box.checked = selected.has(item.id);
         box.disabled = !item.can_trash;
+        box.title = box.disabled ? trashReason(item) : "Select this record for bulk Trash";
         box.setAttribute("aria-label", `Select ${item.title || item.file_name || item.id}`);
         box.addEventListener("change", () => {
           if (box.checked) selected.set(item.id, item);
@@ -420,18 +423,12 @@
       decisions.append(button);
     });
     const actions = el("div", "review-actions");
-    const liveHref = safeLink(item.live_link) || safeLink(item.url);
-    if (liveHref) {
-      const publicLink = el("a", "button button-primary button-compact", item.live_link ? "View live page" : "View exported URL");
-      publicLink.href = liveHref; publicLink.target = "_blank"; publicLink.rel = "noopener noreferrer"; actions.append(publicLink);
-    }
     const adminHref = safeLink(item.wp_admin_url);
     if (adminHref) {
       const admin = el("a", "button button-outline button-compact", item.live_state === "trashed" ? "Open wp-admin Trash" : "Edit in wp-admin");
       admin.href = adminHref; admin.target = "_blank"; admin.rel = "noopener noreferrer"; actions.append(admin);
     }
-    if (writeEnabled) actions.append(makeTrashButton(item));
-    const note = liveNote || trashReason(item);
+    const note = liveNote || "";
     if (note) actions.append(el("p", "review-live-note", note));
     toolbar.append(decisions, actions);
   }
@@ -464,7 +461,15 @@
       addCheck(Boolean(item.live_snapshot_ready) && !item.live_checking, "Fresh version snapshot", item.live_modified ? `Modified ${item.live_modified}` : "A version timestamp is required.");
       addCheck(Boolean(item.live_identity_matches) && !item.live_checking, "Identity matches export", item.live_title ? `Live title: ${item.live_title}` : "WordPress did not return a title.");
       addCheck(["candidate", "approved"].includes(item.review_decision), "Deletion decision", `Current decision: ${humanize(item.review_decision)}`);
-      readiness.append(checks); content.append(readiness);
+      readiness.append(checks);
+      if (writeEnabled) {
+        const trashAction = el("div", "review-trash-action");
+        trashAction.append(makeTrashButton(item, "button button-danger"));
+        const reason = trashReason(item);
+        if (reason) trashAction.append(el("small", "", reason));
+        readiness.append(trashAction);
+      }
+      content.append(readiness);
     }
     if (["found", "trashed"].includes(item.live_state)) {
       const comparison = el("section", "review-comparison");
@@ -489,7 +494,6 @@
     const links = el("section", "review-links");
     const liveHref = safeLink(item.live_link);
     const exportHref = safeLink(item.url);
-    const adminHref = safeLink(item.wp_admin_url);
     function appendLinkRow(label, href, emptyText) {
       const row = el("div", "review-link-row");
       row.append(el("strong", "", label));
@@ -506,11 +510,6 @@
       item.live_link ? "Live page on the site" : "Public URL from the export",
       liveHref || exportHref,
       "No public URL is available for this record.",
-    );
-    appendLinkRow(
-      "WordPress admin editor",
-      adminHref,
-      "No wp-admin edit URL is available.",
     );
     if (exportHref && liveHref && exportHref !== liveHref) {
       appendLinkRow("URL stored in the export", exportHref, "");
@@ -759,7 +758,7 @@
       box.checked = event.target.checked;
       const itemId = box.dataset.id;
       if (!itemId) return;
-      if (box.checked) selected.set(itemId, { id: itemId, title: box.getAttribute("aria-label") || itemId, can_trash: true });
+      if (box.checked) selected.set(itemId, { id: itemId, title: box.dataset.title || itemId, can_trash: true });
       else selected.delete(itemId);
     });
     updateSelectionUI();

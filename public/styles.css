@@ -158,6 +158,8 @@ dialog::backdrop { background: rgba(18,24,29,.72); }
 .review-check.is-ready .review-check-icon { background: #dcefe6; color: #105d3a; }
 .review-check strong, .review-check small { display: block; }
 .review-check small { color: var(--muted); font-size: .7rem; margin-top: 2px; }
+.review-trash-action { align-items: center; border-top: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; padding-top: 12px; }
+.review-trash-action small { color: var(--muted); }
 .comparison-grid { background: var(--line); border: 1px solid var(--line); border-radius: 5px; display: grid; gap: 1px; overflow: hidden; }
 .comparison-row { background: white; display: grid; gap: 10px; grid-template-columns: minmax(90px, .6fr) repeat(2, minmax(0, 1fr)); padding: 9px 10px; }
 .comparison-row span { overflow-wrap: anywhere; }
