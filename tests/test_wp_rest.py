@@ -17,8 +17,8 @@ def test_list_type_follows_total_pages_header():
     def fake_get(url, headers, timeout):
         seen.append(url)
         if "&page=2" in url or url.endswith("page=2"):
-            return 200, [{"id": 2, "status": "publish", "type": "page"}], {"x-wp-totalpages": "2"}
-        return 200, [{"id": 1, "status": "publish", "type": "page"}], {"x-wp-totalpages": "2"}
+            return 200, [{"id": 2, "status": "publish", "type": "page"}], {"x-wp-total": "2", "x-wp-totalpages": "2"}
+        return 200, [{"id": 1, "status": "publish", "type": "page"}], {"x-wp-total": "2", "x-wp-totalpages": "2"}
 
     client = WordPressRestClient("https://example.test", "gcrouch", "secret", http_get=fake_get)
     status, payload = client.list_type("pages", ["1", "2"])
@@ -29,7 +29,7 @@ def test_list_type_follows_total_pages_header():
 
 def test_list_type_rejects_unrelated_include_records():
     def fake_get(url, headers, timeout):
-        return 200, [{"id": 99, "status": "publish", "type": "page"}]
+        return 200, [{"id": 99, "status": "publish", "type": "page"}], {"x-wp-total": "1", "x-wp-totalpages": "1"}
 
     client = WordPressRestClient("https://example.test", "gcrouch", "secret", http_get=fake_get)
     status, payload = client.list_type("pages", ["1"])
@@ -49,9 +49,19 @@ def test_list_type_rejects_non_list_payload():
     assert "unexpected" in results["1"]["error"]
 
 
+def test_list_type_rejects_success_without_completeness_headers():
+    def fake_get(url, headers, timeout):
+        return 200, [{"id": 1, "status": "publish", "type": "page"}]
+
+    client = WordPressRestClient("https://example.test", "gcrouch", "secret", http_get=fake_get)
+    status, payload = client.list_type("pages", ["1", "2"])
+    assert status == 502
+    assert "pagination totals" in payload["message"]
+
+
 def test_list_type_errors_when_pagination_exceeds_limit():
     def fake_get(url, headers, timeout):
-        return 200, [{"id": 1, "status": "publish", "type": "page"}], {"x-wp-totalpages": "21"}
+        return 200, [{"id": 1, "status": "publish", "type": "page"}], {"x-wp-total": "1", "x-wp-totalpages": "21"}
 
     client = WordPressRestClient("https://example.test", "gcrouch", "secret", http_get=fake_get)
     status, payload = client.list_type("pages", ["1"])
@@ -64,7 +74,7 @@ def test_list_type_sends_csv_include_list():
 
     def fake_get(url, headers, timeout):
         seen.append(url)
-        return 200, []
+        return 200, [], {"x-wp-total": "0", "x-wp-totalpages": "0"}
 
     client = WordPressRestClient("https://example.test", "gcrouch", "secret", http_get=fake_get)
     client.list_type("pages", ["1", "2", "3"])
@@ -84,10 +94,10 @@ def test_live_check_found_missing_and_unregistered():
                 "link": "https://example.test/landing",
                 "modified": "2026-01-02T00:00:00",
                 "type": "page",
-            }]
+            }], {"x-wp-total": "1", "x-wp-totalpages": "1"}
         if "/tablepress_table?" in url:
             return 404, {"code": "rest_no_route"}
-        return 200, []
+        return 200, [], {"x-wp-total": "0", "x-wp-totalpages": "0"}
 
     client = WordPressRestClient("https://example.test", "gcrouch", "secret", http_get=fake_get)
     results = live_check_items(
@@ -113,7 +123,7 @@ def test_live_check_labels_trashed_records():
             "link": "https://gradschool.wsu.edu/?page_id=1311",
             "modified": "2026-01-02T00:00:00",
             "type": "page",
-        }]
+        }], {"x-wp-total": "1", "x-wp-totalpages": "1"}
 
     client = WordPressRestClient("https://example.test", "gcrouch", "secret", http_get=fake_get)
     results = live_check_items(
@@ -136,7 +146,7 @@ def test_wordpress_ids_reject_query_injection():
     assert rest_base_url_allowed("https://gradschool.wsu.edu")
     assert not rest_base_url_allowed("http://gradschool.wsu.edu")
     assert rest_base_url_allowed("http://127.0.0.1")
-    assert sites_are_same(["https://gradschool.wsu.edu"], "https://www.gradschool.wsu.edu")
+    assert not sites_are_same(["https://gradschool.wsu.edu"], "https://www.gradschool.wsu.edu")
     assert not sites_are_same(["https://example.test"], "https://gradschool.wsu.edu")
     assert not sites_are_same(["https://gradschool.wsu.edu:8443"], "https://gradschool.wsu.edu")
     assert not sites_are_same(["https://example.test/site-a"], "https://example.test/site-b")
@@ -232,6 +242,45 @@ def test_trash_refuses_when_live_type_does_not_match_export():
     results = trash_items([{"id": "3", "type": "page", "title": "Development page"}], client)
     assert results[0]["ok"] is False
     assert "does not match" in results[0]["error"]
+
+
+def test_trash_refuses_when_live_record_changed_after_check():
+    deleted = []
+
+    def fake_get(url, headers, timeout):
+        return 200, {
+            "id": 3,
+            "status": "publish",
+            "type": "page",
+            "title": {"rendered": "Development page"},
+            "link": "https://example.test/dev",
+            "modified": "2026-01-03T00:00:00",
+        }
+
+    def fake_delete(url, headers, timeout):
+        deleted.append(url)
+        return 200, {"id": 3, "status": "trash", "type": "page"}
+
+    client = WordPressRestClient(
+        "https://example.test", "gcrouch", "secret", http_get=fake_get, http_delete=fake_delete
+    )
+    snapshot = {"3": {
+        "live_state": "found",
+        "live_status": "publish",
+        "live_type": "page",
+        "live_title": "Development page",
+        "live_link": "https://example.test/dev",
+        "live_modified": "2026-01-02T00:00:00",
+        "checked_at": "2026-01-02T00:00:00+00:00",
+    }}
+    results = trash_items(
+        [{"id": "3", "type": "page", "title": "Development page"}],
+        client,
+        expected_live=snapshot,
+    )
+    assert results[0]["ok"] is False
+    assert "changed" in results[0]["error"]
+    assert deleted == []
 
 
 def test_trash_refuses_media_when_wordpress_requires_force_delete():

@@ -168,11 +168,13 @@ class WordPressRestClient:
             # `any` excludes trash and auto-draft in WordPress REST.
             "status": "any,trash",
             "context": "edit",
-            "_fields": "id,status,link,modified,type",
+            "_fields": "id,status,link,modified,type,title",
         }
         collected: list[Any] = []
         requested = set(safe_ids)
         seen_ids: set[str] = set()
+        expected_total: int | None = None
+        expected_pages: int | None = None
         page = 1
         while page <= 20:
             query["page"] = str(page)
@@ -195,19 +197,25 @@ class WordPressRestClient:
                 return 502, {"message": "WordPress REST returned records that were not in the include list."}
             collected.extend(page_records)
             try:
-                total_pages = int(headers.get("x-wp-totalpages") or 0)
-            except ValueError:
-                total_pages = 0
-            if total_pages:
-                if page >= total_pages:
-                    break
-            elif not payload or len(payload) < int(query["per_page"]):
-                break
-            elif len(seen_ids) >= len(safe_ids):
+                total = int(headers["x-wp-total"])
+                total_pages = int(headers["x-wp-totalpages"])
+            except (KeyError, TypeError, ValueError):
+                return 502, {"message": "WordPress REST omitted valid pagination totals; missing records cannot be determined safely."}
+            if total < 0 or total_pages < 0 or total > len(requested):
+                return 502, {"message": "WordPress REST returned inconsistent pagination totals."}
+            if (total == 0) != (total_pages == 0) or total_pages > 20:
+                return 502, {"message": "WordPress REST returned inconsistent pagination totals."}
+            if expected_total is None:
+                expected_total, expected_pages = total, total_pages
+            elif total != expected_total or total_pages != expected_pages:
+                return 502, {"message": "WordPress REST pagination totals changed during the live check."}
+            if page >= total_pages or len(seen_ids) >= total:
                 break
             page += 1
         else:
             return 502, {"message": "WordPress REST listing exceeded the pagination limit."}
+        if expected_total is None or len(seen_ids) != expected_total:
+            return 502, {"message": "WordPress REST returned an incomplete list response."}
         return 200, collected
 
     def get_item(self, rest_base: str, item_id: str) -> tuple[int, Any]:
@@ -248,6 +256,8 @@ def _empty_live(item_id: str, rest_base: str | None, live_state: str, error: str
         "live_state": live_state,
         "live_found": live_state in {"found", "trashed"},
         "live_status": "",
+        "live_type": "",
+        "live_title": "",
         "live_link": "",
         "live_modified": "",
         "error": error,
@@ -319,6 +329,8 @@ def live_check_items(
             live_state = "trashed" if live_status == "trash" else "found"
             live = _empty_live(item_id, rest_base, live_state)
             live["live_status"] = live_status
+            live["live_type"] = str(record.get("type") or "")
+            live["live_title"] = _rendered_title(record)
             live["live_link"] = str(record.get("link") or "")
             live["live_modified"] = str(record.get("modified") or "")
             if live_state == "trashed":
@@ -357,6 +369,7 @@ def trash_items(
     items: list[dict],
     client: WordPressRestClient,
     site_url: str = "",
+    expected_live: dict[str, dict] | None = None,
 ) -> list[dict]:
     """Move exported records to WordPress Trash. Never force-deletes."""
     results: list[dict] = []
@@ -378,6 +391,20 @@ def trash_items(
                 "ok": False,
                 "title": title,
                 "error": "This content type is not available through WordPress REST, so it cannot be trashed from this app.",
+            })
+            continue
+        snapshot = (expected_live or {}).get(item_id) or {}
+        if expected_live is not None and (
+            snapshot.get("live_state") != "found"
+            or not snapshot.get("checked_at")
+            or not snapshot.get("live_status")
+            or not snapshot.get("live_modified")
+        ):
+            results.append({
+                "id": item_id,
+                "ok": False,
+                "title": title,
+                "error": "A complete fresh live snapshot is required before Trash. Open the record and check WordPress again.",
             })
             continue
         try:
@@ -429,6 +456,28 @@ def trash_items(
                 "error": f"Live WordPress title is now {live_title!r}, not the exported title. Re-check before Trash.",
             })
             continue
+        if expected_live is not None:
+            current_status = str(current.get("status") or "")
+            current_modified = str(current.get("modified") or "")
+            current_link = str(current.get("link") or "")
+            snapshot_title = str(snapshot.get("live_title") or "")
+            changed = []
+            if current_status != str(snapshot.get("live_status") or ""):
+                changed.append("status")
+            if current_modified != str(snapshot.get("live_modified") or ""):
+                changed.append("modified time")
+            if snapshot_title and live_title != snapshot_title:
+                changed.append("title")
+            if snapshot.get("live_link") and current_link != str(snapshot.get("live_link")):
+                changed.append("URL")
+            if changed:
+                results.append({
+                    "id": item_id,
+                    "ok": False,
+                    "title": title,
+                    "error": f"The live record changed after it was checked ({', '.join(changed)}). Review it again before Trash.",
+                })
+                continue
         try:
             status, payload = client.trash(rest_base, item_id)
         except (URLError, TimeoutError, OSError, ValueError) as exc:
@@ -466,6 +515,8 @@ def trash_items(
             live_state = "trashed"
             live = _empty_live(item_id, rest_base, live_state)
             live["live_status"] = live_status
+            live["live_type"] = returned_type or expected_type
+            live["live_title"] = _rendered_title(payload)
             live["live_link"] = str(payload.get("link") or "")
             live["live_modified"] = str(payload.get("modified") or "")
             live["wp_admin_url"] = wp_admin_trash_url(site_url, returned_type or expected_type)

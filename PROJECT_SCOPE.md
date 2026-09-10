@@ -21,7 +21,7 @@ The working application now:
 - Separates strong, possible, and structural references and retains where-used evidence.
 - Identifies expected development content using configurable Greg Crouch author aliases without replacing the underlying finding.
 - Provides server-side search, filters, pagination, taxonomy drill-down, record details, in-memory review decisions, a cross-group work queue, and filtered CSV/JSON exports.
-- Locally, can check a group against live WordPress REST and move selected records to Trash after confirmation. Trash uses WordPress `DELETE` without `force`, requires a found live check plus candidate/approved review, and is loopback- and CSRF-gated.
+- Locally, refreshes an opened review record from live WordPress REST and can move selected records to Trash after confirmation. Trash uses WordPress `DELETE` without `force`, requires a complete fresh live snapshot plus candidate/approved review, rejects version drift, and is loopback- and CSRF-gated.
 - Marks published Events Calendar and graduate factsheet records as needing verification from an assumed public archive; it does not treat that archive as proven reachability.
 - Escapes displayed content and protects CSV cells from spreadsheet formula injection.
 
@@ -77,9 +77,10 @@ The intended workflow is:
 
 1. Select a content group.
 2. Filter by finding, status, author, subtype, taxonomy term, or search text.
-3. Open record details and inspect metadata plus where-used evidence.
-4. Assign an in-memory review decision: Keep, Expected Development, Verify, Deletion Candidate, or Approved to Delete.
-5. Export the current filtered view to CSV or JSON, or use the work queue to review unreferenced records, live-missing records, and deletion candidates.
+3. Open the review sheet; when local REST is configured, it refreshes the record and compares the export with live identity and version fields.
+4. Assign a review decision: Keep, Expected Development, Verify, Deletion Candidate, or Approved to Delete.
+5. For Candidate or Approved records with a complete matching live snapshot, confirm Move to Trash directly in the review sheet.
+6. Export the current filtered view to CSV or JSON, or use the work queue to review unreferenced records, live-missing records, and deletion candidates.
 
 Locally, with `WP_REST_WRITE_ENABLED=1`, the app can move selected records to WordPress Trash after an explicit confirmation. It never force-deletes. Restore remains a WordPress admin action.
 

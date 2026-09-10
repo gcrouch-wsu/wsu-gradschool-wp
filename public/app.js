@@ -33,12 +33,15 @@
   };
   function trashReason(item) {
     if (!writeEnabled) return "Local WordPress Trash is not enabled.";
+    if (item.live_checking) return "Wait for the fresh WordPress check to finish.";
     if (item.can_trash) return "";
     if (item.live_state === "unchecked") return "Live-check this record first, then mark Candidate or Approved.";
     if (item.live_state === "missing") return "This record was not found on live WordPress.";
     if (item.live_state === "trashed") return "Already in WordPress Trash.";
     if (item.live_state === "not-in-rest") return "This content type cannot be trashed through WordPress REST.";
     if (item.live_state === "error") return "Live check failed, so Trash is blocked.";
+    if (item.live_state === "found" && !item.live_snapshot_ready) return "WordPress did not return a complete version snapshot, so Trash is blocked.";
+    if (item.live_snapshot_ready && !item.live_identity_matches) return "The live title or type differs from the export. Review a current export before Trash.";
     if (!["candidate", "approved"].includes(item.review_decision)) return "Mark Candidate or Approved to enable Trash.";
     return "Trash is not available for this record.";
   }
@@ -228,6 +231,10 @@
       selectPage.indeterminate = false;
     }
   }
+  function clearSelection() {
+    selected.clear();
+    updateSelectionUI();
+  }
   async function loadQueueCount() {
     const node = qs("#queue-tab-count");
     if (!node) return;
@@ -246,8 +253,9 @@
     }
     const preview = titles.slice(0, 8).join("\n");
     const extra = titles.length > 8 ? `\n…and ${titles.length - 8} more` : "";
+    const site = dashboard.site?.site_url || dashboard.site?.home_url || "the configured WordPress site";
     const confirmed = window.confirm(
-      `Move ${ids.length} record${ids.length === 1 ? "" : "s"} to Trash in live WordPress?\n\nThis can be undone in WordPress Trash. It is not a permanent delete.\n\n${preview}${extra}`,
+      `Move ${ids.length} record${ids.length === 1 ? "" : "s"} to Trash in live WordPress?\n\nSite: ${site}\nThis can be undone in WordPress Trash. It is not a permanent delete.\n\n${preview}${extra}`,
     );
     if (!confirmed) return false;
     const payload = await responseJson(await fetch("/api/trash", {
@@ -406,6 +414,7 @@
     ].forEach(([value, label]) => {
       const button = el("button", "button button-compact review-decision", label);
       button.type = "button";
+      button.disabled = Boolean(item.live_checking);
       button.classList.toggle("is-active", item.review_decision === value);
       button.addEventListener("click", () => saveReviewDecision(value, { advance: value === "keep" }));
       decisions.append(button);
@@ -435,6 +444,48 @@
     findingText.append(el("strong", "", item.recommendation), el("p", "", item.reasons.join(" ")));
     finding.append(badge(item.classification), findingText); content.append(finding);
     if (item.expected_development) finding.append(badge("expected-development"));
+    if (item.live_state === "trashed") {
+      const complete = el("section", "review-complete");
+      complete.append(el("strong", "", "This record is in WordPress Trash."), el("p", "", "The move was reversible; restoration remains a WordPress admin action."));
+      content.append(complete);
+    } else {
+      const readiness = el("section", "review-readiness");
+      readiness.append(el("h3", "", "Trash readiness"));
+      const checks = el("div", "review-checklist");
+      const addCheck = (ready, label, detail) => {
+        const row = el("div", `review-check ${ready ? "is-ready" : "is-pending"}`);
+        row.append(el("span", "review-check-icon", ready ? "✓" : "—"));
+        const copy = el("span"); copy.append(el("strong", "", label));
+        if (detail) copy.append(el("small", "", detail));
+        row.append(copy); checks.append(row);
+      };
+      addCheck(restEnabled, "Local WordPress REST", restEnabled ? "Configured for this review session." : "Configure local REST to check and trash records.");
+      addCheck(item.live_state === "found" && !item.live_checking, "Found on live WordPress", item.live_checking ? "Refreshing now…" : humanize(item.live_state || "unchecked"));
+      addCheck(Boolean(item.live_snapshot_ready) && !item.live_checking, "Fresh version snapshot", item.live_modified ? `Modified ${item.live_modified}` : "A version timestamp is required.");
+      addCheck(Boolean(item.live_identity_matches) && !item.live_checking, "Identity matches export", item.live_title ? `Live title: ${item.live_title}` : "WordPress did not return a title.");
+      addCheck(["candidate", "approved"].includes(item.review_decision), "Deletion decision", `Current decision: ${humanize(item.review_decision)}`);
+      readiness.append(checks); content.append(readiness);
+    }
+    if (["found", "trashed"].includes(item.live_state)) {
+      const comparison = el("section", "review-comparison");
+      comparison.append(el("h3", "", "Export and live identity"));
+      const grid = el("div", "comparison-grid");
+      const head = el("div", "comparison-row comparison-head");
+      head.append(el("strong", "", "Field"), el("span", "", "Export"), el("span", "", "Live WordPress"));
+      grid.append(head);
+      [
+        ["WordPress ID", item.id, item.id],
+        ["Type", humanize(item.type), humanize(item.live_type || "Not returned")],
+        ["Title", item.title || "Untitled", item.live_title || "Untitled"],
+        ["Status", humanize(item.status), humanize(item.live_status || "Not returned")],
+        ["Modified", item.modified || "Not exported", item.live_modified || "Not returned"],
+      ].forEach(([label, exported, live]) => {
+        const row = el("div", "comparison-row");
+        row.append(el("strong", "", label), el("span", "", exported), el("span", "", live));
+        grid.append(row);
+      });
+      comparison.append(grid); content.append(comparison);
+    }
     const links = el("section", "review-links");
     const liveHref = safeLink(item.live_link);
     const exportHref = safeLink(item.url);
@@ -543,7 +594,7 @@
     if (!restEnabled) return "";
     if (item.live_state === "unchecked") return "Checking live WordPress for this record…";
     if (writeEnabled && item.live_state === "found" && !item.can_trash) {
-      return "Mark Candidate or Approved to enable Trash. Keep and Trash stay on this sheet.";
+      return trashReason(item);
     }
     if (item.live_state === "found" && item.can_trash) return "This record is live. Confirm Trash to move it to WordPress Trash.";
     return "";
@@ -558,6 +609,8 @@
   }
   async function liveCheckCurrent(seq) {
     const id = review.ids[review.index];
+    review.item = { ...review.item, can_trash: false, live_checking: true };
+    renderReviewBody(review.item);
     renderReviewToolbar(review.item, "Checking live WordPress for this record…");
     try {
       await responseJson(await fetch("/api/live-check", {
@@ -570,6 +623,8 @@
       loadQueueCount();
     } catch (error) {
       if (seq !== review.seq) return;
+      review.item = { ...review.item, live_checking: false, can_trash: false };
+      renderReviewBody(review.item);
       renderReviewToolbar(review.item, error.message || "Live WordPress check failed.");
     }
   }
@@ -595,15 +650,14 @@
     try {
       const ok = await trashRecords(
         [item.id],
-        [item.title || item.file_name || `ID ${item.id}`],
+        [`${item.live_title || item.title || item.file_name || "Untitled"} (${humanize(item.live_type || item.type)} #${item.id})`],
         { quiet: true, skipReload: true },
       );
       if (!ok) { button.disabled = false; return; }
       updateSelectionUI();
       await loadItems();
       loadQueueCount();
-      if (review.index < review.ids.length - 1) await goReview(1);
-      else await refreshCurrentItem();
+      await refreshCurrentItem();
     } catch (error) {
       window.alert(error.message || "WordPress Trash failed.");
       button.disabled = false;
@@ -622,7 +676,7 @@
       review.item = item;
       renderReviewBody(item);
       renderReviewToolbar(item, liveNoteFor(item));
-      if (restEnabled && (!item.live_state || item.live_state === "unchecked")) {
+      if (restEnabled) {
         await liveCheckCurrent(seq);
       }
     } catch (error) {
@@ -667,6 +721,7 @@
     } catch (error) { grid.replaceChildren(el("p", "alert alert-error", error.message)); }
   }
   function chooseGroup(groupId) {
+    clearSelection();
     state.queue = false;
     state.group = groupId; state.page = 1; state.taxonomy = ""; state.term = ""; controls.search.value = "";
       [controls.classification, controls.status, controls.author, controls.subtype, controls.fileType, controls.decision].forEach((control) => { control.value = ""; });
@@ -680,6 +735,7 @@
     const nextQueue = tab.dataset.queue === "1";
     if (tab.dataset.panel === "content-panel" && state.queue !== nextQueue) {
       state.queue = nextQueue;
+      clearSelection();
       state.page = 1;
       if (state.queue) qsa(".group-card").forEach((card) => card.classList.remove("is-active"));
       else qsa(".group-card").forEach((card) => card.classList.toggle("is-active", card.dataset.group === state.group));
@@ -720,10 +776,10 @@
       updateSelectionUI();
     }
   });
-  qs("#clear-taxonomy-filter").addEventListener("click", () => { state.taxonomy = ""; state.term = ""; state.page = 1; review.filterKey = ""; review.ids = []; qs("#active-taxonomy-filter").hidden = true; loadItems(); });
+  qs("#clear-taxonomy-filter").addEventListener("click", () => { clearSelection(); state.taxonomy = ""; state.term = ""; state.page = 1; review.filterKey = ""; review.ids = []; qs("#active-taxonomy-filter").hidden = true; loadItems(); });
   qs("#previous-page").addEventListener("click", () => { state.page -= 1; loadItems(); }); qs("#next-page").addEventListener("click", () => { state.page += 1; loadItems(); });
-  controls.search.addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { state.page = 1; review.filterKey = ""; review.ids = []; loadItems(); }, 250); });
-  [controls.classification, controls.status, controls.author, controls.subtype, controls.fileType, controls.decision, controls.live, controls.sort, controls.pageSize].filter(Boolean).forEach((control) => control.addEventListener("change", () => { state.page = 1; if (control !== controls.pageSize) { review.filterKey = ""; review.ids = []; } loadItems(); }));
+  controls.search.addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { clearSelection(); state.page = 1; review.filterKey = ""; review.ids = []; loadItems(); }, 250); });
+  [controls.classification, controls.status, controls.author, controls.subtype, controls.fileType, controls.decision, controls.live, controls.sort, controls.pageSize].filter(Boolean).forEach((control) => control.addEventListener("change", () => { clearSelection(); state.page = 1; if (control !== controls.pageSize) { review.filterKey = ""; review.ids = []; } loadItems(); }));
   qs("#review-prev").addEventListener("click", () => goReview(-1));
   qs("#review-next").addEventListener("click", () => goReview(1));
   qs("#close-dialog").addEventListener("click", () => qs("#detail-dialog").close());

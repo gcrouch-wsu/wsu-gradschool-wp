@@ -140,6 +140,34 @@ def create_app() -> Flask:
     def latest_state():
         return audit_store.load_state(session.get("audit_id"))
 
+    def export_site_url(site: dict) -> str:
+        """Use the WordPress installation URL; fall back to home only when absent."""
+        return str(site.get("site_url") or site.get("home_url") or "")
+
+    def export_matches_rest(site: dict, rest_url: str) -> bool:
+        site_url = export_site_url(site)
+        return bool(site_url and sites_are_same([site_url], rest_url))
+
+    def live_snapshot_ready(row: dict, record: dict) -> bool:
+        return bool(
+            rest_base_for(row.get("type", ""))
+            and record.get("live_state") == "found"
+            and record.get("checked_at")
+            and record.get("live_status")
+            and record.get("live_modified")
+            and record.get("live_type") == row.get("type")
+        )
+
+    def live_identity_matches(row: dict, record: dict) -> bool:
+        live_title = str(record.get("live_title") or "").strip()
+        export_title = str(row.get("title") or "").strip()
+        return bool(
+            live_snapshot_ready(row, record)
+            and live_title
+            and export_title
+            and live_title.casefold() == export_title.casefold()
+        )
+
     def analyze_and_store(stream, filename: str, audit_id: str) -> dict:
         started = perf_counter()
         export = parse_wxr(stream)
@@ -244,12 +272,16 @@ def create_app() -> Flask:
         record = live.get(row["id"]) or {}
         payload["live_state"] = record.get("live_state") or "unchecked"
         payload["live_status"] = record.get("live_status") or ""
+        payload["live_type"] = record.get("live_type") or ""
+        payload["live_title"] = record.get("live_title") or ""
         payload["live_link"] = record.get("live_link") or ""
+        payload["live_modified"] = record.get("live_modified") or ""
         payload["live_found"] = bool(record.get("live_found"))
         payload["live_checked_at"] = record.get("checked_at") or ""
+        payload["live_snapshot_ready"] = live_snapshot_ready(row, record)
+        payload["live_identity_matches"] = live_identity_matches(row, record)
         payload["can_trash"] = bool(
-            rest_base_for(row.get("type", ""))
-            and payload["live_state"] == "found"
+            payload["live_identity_matches"]
             and payload["review_decision"] in {"candidate", "approved"}
         )
         if record.get("wp_admin_url"):
@@ -262,13 +294,17 @@ def create_app() -> Flask:
         record = live.get(row["id"]) or {}
         exported["live_state"] = record.get("live_state") or "unchecked"
         exported["live_status"] = record.get("live_status") or ""
+        exported["live_type"] = record.get("live_type") or ""
+        exported["live_title"] = record.get("live_title") or ""
         exported["live_link"] = record.get("live_link") or ""
+        exported["live_modified"] = record.get("live_modified") or ""
         exported["live_found"] = bool(record.get("live_found"))
         exported["live_error"] = record.get("error") or ""
         exported["live_checked_at"] = record.get("checked_at") or ""
+        exported["live_snapshot_ready"] = live_snapshot_ready(row, record)
+        exported["live_identity_matches"] = live_identity_matches(row, record)
         exported["can_trash"] = bool(
-            rest_base_for(row.get("type", ""))
-            and exported["live_state"] == "found"
+            exported["live_identity_matches"]
             and exported["review_decision"] in {"candidate", "approved"}
         )
         if record.get("wp_admin_url"):
@@ -527,18 +563,29 @@ def create_app() -> Flask:
             return jsonify({"error": "No export has been analyzed."}), 404
         data = request.get_json(silent=True) or {}
         group = str(data.get("group") or request.args.get("group") or "").strip()
-        raw_ids = data.get("ids") if isinstance(data.get("ids"), list) else []
-        wanted = {item_id for item_id in (wordpress_id(value) for value in raw_ids) if item_id}
+        ids_supplied = "ids" in data
+        raw_ids = data.get("ids")
+        if ids_supplied:
+            if not isinstance(raw_ids, list) or not raw_ids:
+                return jsonify({"error": "Choose one or more valid WordPress records to check."}), 400
+            parsed_ids = [wordpress_id(value) for value in raw_ids]
+            if any(item_id is None for item_id in parsed_ids):
+                return jsonify({"error": "Each live-check ID must be a positive WordPress ID."}), 400
+            wanted = set(parsed_ids)
+        else:
+            wanted = set()
+            if not group:
+                return jsonify({"error": "Choose a content group or one or more records to check."}), 400
         site = state["report"].get("site") or {}
         rest_url = os.environ.get("WP_REST_BASE_URL", "")
-        if not sites_are_same([site.get("site_url") or "", site.get("home_url") or ""], rest_url):
+        if not export_matches_rest(site, rest_url):
             return jsonify({"error": "This export is not from the WordPress site configured for local REST."}), 409
         items = [
             row for row in state["report"]["items"]
             if (not group or row["group"] == group) and (not wanted or row["id"] in wanted)
         ]
         try:
-            site_url = site.get("site_url") or site.get("home_url") or ""
+            site_url = export_site_url(site)
             results = live_check_items(items, client_from_env(), site_url=site_url)
         except PermissionError as exc:
             return jsonify({"error": str(exc)}), 403
@@ -593,19 +640,19 @@ def create_app() -> Flask:
         if missing:
             return jsonify({"error": f"Unknown record ID: {missing[0]}."}), 404
         site = state["report"].get("site") or {}
-        site_url = site.get("site_url") or site.get("home_url") or ""
+        site_url = export_site_url(site)
         rest_url = os.environ.get("WP_REST_BASE_URL", "")
-        if not sites_are_same([site.get("site_url") or "", site.get("home_url") or ""], rest_url):
+        if not export_matches_rest(site, rest_url):
             return jsonify({"error": "This export is not from the WordPress site configured for local REST writes."}), 409
         not_ready = [
             item_id for item_id in ids
-            if (state["live"].get(item_id) or {}).get("live_state") != "found"
+            if not live_identity_matches(by_id[item_id], state["live"].get(item_id) or {})
             or state["decisions"].get(item_id) not in {"candidate", "approved"}
         ]
         if not_ready:
             return jsonify({
                 "error": (
-                    f"Record {not_ready[0]} must be live-checked as found and marked "
+                    f"Record {not_ready[0]} needs a complete fresh live check that matches the export and must be marked "
                     "candidate or approved before Trash."
                 )
             }), 400
@@ -614,7 +661,12 @@ def create_app() -> Flask:
             return jsonify({"error": f"Record {unsupported[0]} cannot be trashed through WordPress REST."}), 400
         items = [by_id[item_id] for item_id in ids]
         try:
-            results = trash_items(items, client_from_env(), site_url=site_url)
+            results = trash_items(
+                items,
+                client_from_env(),
+                site_url=site_url,
+                expected_live=state["live"],
+            )
         except PermissionError as exc:
             return jsonify({"error": str(exc)}), 403
         except Exception:
@@ -683,7 +735,8 @@ def create_app() -> Flask:
             "categories", "tags", "taxonomies", "taxonomy_terms", "meta_keys",
             "classification", "underlying_classification", "confidence", "reasons", "recommendation",
             "inbound_strong", "inbound_possible", "inbound_structural", "outbound",
-            "review_decision", "live_state", "live_status", "live_link", "live_checked_at",
+            "review_decision", "live_state", "live_status", "live_type", "live_title",
+            "live_link", "live_modified", "live_checked_at", "live_snapshot_ready", "live_identity_matches",
         )
         def generate_csv():
             output = io.StringIO(newline="")

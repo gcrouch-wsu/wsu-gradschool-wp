@@ -122,8 +122,9 @@ def test_live_check_merges_read_only_wordpress_status(monkeypatch):
                 "link": "https://example.test/landing",
                 "modified": "2026-01-02T00:00:00",
                 "type": "page",
-            }]
-        return 200, []
+                "title": {"rendered": "Landing page"},
+            }], {"x-wp-total": "1", "x-wp-totalpages": "1"}
+        return 200, [], {"x-wp-total": "0", "x-wp-totalpages": "0"}
 
     monkeypatch.setenv("WP_REST_ALLOW_IN_TESTS", "1")
     monkeypatch.setenv("WP_REST_ENABLED", "1")
@@ -144,6 +145,9 @@ def test_live_check_merges_read_only_wordpress_status(monkeypatch):
     assert listing["total"] == 1
     assert listing["items"][0]["id"] == "1"
     assert listing["items"][0]["live_status"] == "publish"
+    assert listing["items"][0]["live_title"] == "Landing page"
+    assert listing["items"][0]["live_snapshot_ready"] is True
+    assert listing["items"][0]["live_identity_matches"] is True
     by_id = client.post("/api/live-check", json={"ids": ["1"]})
     assert by_id.status_code == 200
     assert by_id.get_json()["checked"] == 1
@@ -178,15 +182,17 @@ def test_confirmed_trash_updates_live_state(monkeypatch):
     def fake_get(url, _headers, _timeout):
         if "/pages?" in url:
             return 200, [
-                {"id": 1, "status": "publish", "type": "page"},
-                {"id": 2, "status": "publish", "type": "page"},
-                {"id": 3, "status": "publish", "type": "page"},
-            ]
+                {"id": 1, "status": "publish", "type": "page", "title": {"rendered": "Landing page"}, "link": "https://example.test/landing", "modified": "2026-01-02T00:00:00"},
+                {"id": 2, "status": "publish", "type": "page", "title": {"rendered": "Child page"}, "link": "https://example.test/child", "modified": "2026-01-02T00:00:00"},
+                {"id": 3, "status": "publish", "type": "page", "title": {"rendered": "Development page"}, "link": "https://example.test/dev", "modified": "2026-01-02T00:00:00"},
+            ], {"x-wp-total": "3", "x-wp-totalpages": "1"}
         return 200, {
             "id": 3,
             "status": "publish",
             "type": "page",
             "title": {"rendered": "Development page"},
+            "link": "https://example.test/dev",
+            "modified": "2026-01-02T00:00:00",
         }
 
     def fake_delete(url, _headers, _timeout):
@@ -253,6 +259,30 @@ def test_trash_refuses_export_from_a_different_site(monkeypatch):
     assert "not from the WordPress site" in response.get_json()["error"]
 
 
+def test_live_check_does_not_use_home_url_to_override_wordpress_site_url(monkeypatch):
+    monkeypatch.setenv("WP_REST_ALLOW_IN_TESTS", "1")
+    monkeypatch.setenv("WP_REST_ENABLED", "1")
+    monkeypatch.setenv("WP_REST_BASE_URL", "https://example.test")
+    monkeypatch.setenv("WP_REST_USERNAME", "gcrouch")
+    monkeypatch.setenv("WP_REST_APPLICATION_PASSWORD", "not-a-real-password")
+
+    wxr = WXR.replace(
+        b"<link>https://example.test</link>",
+        b"<link>https://example.test</link><wp:site_url>https://different.test</wp:site_url>",
+        1,
+    )
+    app = create_app()
+    app.config.update(TESTING=True)
+    client = app.test_client()
+    assert client.post(
+        "/",
+        data={"export_file": (BytesIO(wxr), "test.xml")},
+        content_type="multipart/form-data",
+    ).status_code == 200
+    response = client.post("/api/live-check", json={"ids": ["3"]})
+    assert response.status_code == 409
+
+
 def test_trash_rejects_non_loopback_clients_and_null_origin(monkeypatch):
     monkeypatch.setenv("WP_REST_ALLOW_IN_TESTS", "1")
     monkeypatch.setenv("WP_REST_ENABLED", "1")
@@ -312,4 +342,3 @@ def test_decision_write_conflicts_when_revision_changes():
         raise AssertionError("Stale revision must conflict.")
     except RevisionConflict as exc:
         assert exc.current_rev == 2
-

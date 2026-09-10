@@ -35,8 +35,6 @@ def site_identity(url: str) -> tuple[str, str, int, str] | None:
     scheme = (parsed.scheme or "").lower()
     if scheme not in {"http", "https"} or not host:
         return None
-    if host.startswith("www."):
-        host = host[4:]
     if port is None:
         port = 443 if scheme == "https" else 80
     path = (parsed.path or "/").rstrip("/") or "/"

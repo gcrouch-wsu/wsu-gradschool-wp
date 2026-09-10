@@ -19,9 +19,9 @@ Greg Crouch and `gcrouch` are treated as expected-development author aliases by 
 
 ## Local WordPress REST
 
-Copy `.env.example` to `.env.local` and add a WordPress Application Password. Restart the Flask app. The dashboard can then check the current content group against live WordPress and add wp-admin links to the table, details, and CSV/JSON exports.
+Copy `.env.example` to `.env.local` and add a WordPress Application Password. Restart the Flask app. Opening a record in the review sheet refreshes that record from live WordPress and shows the exported and live identity side by side.
 
-To move records to WordPress Trash from the app, also set `WP_REST_WRITE_ENABLED=1`. Trash is local-loopback only, CSRF-protected, confirmed in the browser, capped at 25 records per request, and never uses WordPress `force` delete. A record must be live-checked as found and marked candidate or approved first. Items can be restored from WordPress Trash. Media may refuse trash if `MEDIA_TRASH` is disabled; the app will not permanently delete those files.
+To move records to WordPress Trash from the app, also set `WP_REST_WRITE_ENABLED=1`. Trash is local-loopback only, CSRF-protected, confirmed in the browser, capped at 25 records per request, and never uses WordPress `force` delete. In the review sheet, wait for the fresh live check, mark the record Candidate or Approved, and use Move to Trash. The server re-reads the live record and refuses the write if its identity or version changed. Items can be restored from WordPress Trash. Media may refuse trash if `MEDIA_TRASH` is disabled; the app will not permanently delete those files.
 
 Do not add `WP_REST_*` variables to Vercel. Live REST and Trash are local-only.
 
