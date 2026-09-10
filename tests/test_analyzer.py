@@ -230,6 +230,18 @@ def test_shortcodes_and_reusable_blocks_create_references():
     assert not any(entry["kind"] == "gravityform" for entry in rows["7"]["evidence"])
 
 
+def test_unmatched_gravity_form_shortcodes_are_one_warning():
+    wxr = WXR.replace(
+        b"<a href=\"/child/\">Child</a>",
+        b"""<a href="/child/">Child</a>[gravityform id=99][gravityform id=99]""",
+    )
+    report = analyze_export(parse_wxr(BytesIO(wxr)))
+    gf = [warning for warning in report["warnings"] if "Gravity Form" in warning]
+    assert len(gf) == 1
+    assert "2 Gravity Form shortcodes" in gf[0]
+    assert "1 plugin form ID" in gf[0]
+
+
 def test_parser_skips_non_canonical_wordpress_ids():
     hostile = WXR.replace(b"<wp:post_id>3</wp:post_id>", b"<wp:post_id>3?force=true</wp:post_id>")
     export = parse_wxr(BytesIO(hostile))

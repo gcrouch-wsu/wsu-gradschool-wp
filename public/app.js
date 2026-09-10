@@ -53,7 +53,9 @@
   wireUpload("#replacement-file", "#replacement-label");
   const runtime = JSON.parse(qs("#runtime-data")?.textContent || "{}");
   const chunkSize = Number(runtime.chunk_size) || (3 * 1024 * 1024);
+  const restEnabled = Boolean(runtime.rest_enabled);
   const writeEnabled = Boolean(runtime.rest_write_enabled);
+  const review = { ids: [], index: 0, total: 0, open: false, item: null, seq: 0, filterKey: "" };
 
   function uploadError(form, message) {
     form.parentElement?.querySelector(".upload-runtime-error")?.remove();
@@ -204,18 +206,18 @@
       node.textContent = "";
     }
   }
-  async function trashRecords(ids, titles) {
-    if (!ids.length) return;
+  async function trashRecords(ids, titles, options = {}) {
+    if (!ids.length) return false;
     if (ids.length > 25) {
       window.alert("Move at most 25 records to Trash at a time.");
-      return;
+      return false;
     }
     const preview = titles.slice(0, 8).join("\n");
     const extra = titles.length > 8 ? `\n…and ${titles.length - 8} more` : "";
     const confirmed = window.confirm(
       `Move ${ids.length} record${ids.length === 1 ? "" : "s"} to Trash in live WordPress?\n\nThis can be undone in WordPress Trash. It is not a permanent delete.\n\n${preview}${extra}`,
     );
-    if (!confirmed) return;
+    if (!confirmed) return false;
     const payload = await responseJson(await fetch("/api/trash", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -225,12 +227,15 @@
     const failed = payload.results.filter((result) => !result.ok);
     if (failed.length) {
       window.alert(`Moved ${payload.trashed} to Trash.\n${failed.length} failed:\n${failed.map((result) => `${result.title}: ${result.error}`).join("\n")}`);
-    } else {
+    } else if (!options.quiet) {
       window.alert(`Moved ${payload.trashed} record${payload.trashed === 1 ? "" : "s"} to WordPress Trash.`);
     }
-    updateSelectionUI();
-    await loadItems();
-    loadQueueCount();
+    if (!options.skipReload) {
+      updateSelectionUI();
+      await loadItems();
+      loadQueueCount();
+    }
+    return failed.length === 0 && payload.trashed === ids.length;
   }
   const badge = (value) => el("span", `badge badge-${value}`, humanize(value));
   const meta = (text) => el("small", "content-meta", text || "—");
@@ -280,7 +285,7 @@
       author.textContent = item.author_name || item.author_login || "Unknown";
       if (item.author_name && item.author_login && item.author_name !== item.author_login) author.append(meta(item.author_login));
       taxonomy.append(taxonomySummary(item)); published.textContent = dateOnly(item.created); updated.textContent = dateOnly(item.modified); review.append(reviewSelect(item));
-      const button = el("button", "button button-detail", "Details"); button.type = "button"; button.addEventListener("click", () => openDetails(item.id)); actions.append(button);
+      const button = el("button", "button button-detail", "Review"); button.type = "button"; button.addEventListener("click", () => openDetails(item.id)); actions.append(button);
       if (writeEnabled) {
         const select = document.createElement("td");
         const box = el("input", "row-select");
@@ -322,74 +327,268 @@
     finally { qs("#results-body").classList.remove("is-loading"); }
   }
   function detailField(list, name, value) { const field = el("div", "detail-field"); field.append(el("dt", "", name), el("dd", "", value || "—")); list.append(field); }
-  async function openDetails(id) {
-    const dialog = qs("#detail-dialog"); qs("#detail-title").textContent = "Loading record…"; qs("#detail-content").replaceChildren(el("p", "loading-copy", "Retrieving metadata and evidence…")); dialog.showModal();
-    try {
-      const response = await fetch(`/api/items/${encodeURIComponent(id)}`); if (!response.ok) throw new Error("Record details could not be loaded."); const item = await response.json();
-      qs("#detail-title").textContent = item.title || item.file_name || "Untitled"; qs("#detail-kicker").textContent = `${item.group_label} · WordPress ID ${item.id}`;
-      const content = qs("#detail-content"); content.replaceChildren(); const finding = el("section", "detail-finding"), findingText = el("div");
-      findingText.append(el("strong", "", item.recommendation), el("p", "", item.reasons.join(" "))); finding.append(badge(item.classification), findingText); content.append(finding);
-      if (item.expected_development) finding.append(badge("expected-development"));
-      const actionsBar = el("div", "detail-actions");
-      const adminHref = safeLink(item.wp_admin_url);
-      if (adminHref) {
-        const admin = el("a", "button button-primary", item.live_state === "trashed" ? "Open Trash in WordPress" : "Open in WordPress");
-        admin.href = adminHref; admin.target = "_blank"; admin.rel = "noopener noreferrer"; actionsBar.append(admin);
+  function reviewContext(item) {
+    return [
+      `${review.index + 1} of ${review.total}`,
+      state.queue ? "Work queue" : (item.group_label || activeGroup().label || "Content"),
+      humanize(item.classification),
+    ].join(" · ");
+  }
+  function updateReviewNav() {
+    qs("#review-prev").disabled = review.index <= 0;
+    qs("#review-next").disabled = review.index >= review.ids.length - 1;
+    qs("#review-position").textContent = review.total ? `${review.index + 1} of ${review.total}` : "—";
+  }
+  async function ensureReviewIds(id) {
+    const key = queryParams(false).toString();
+    if (review.filterKey !== key || !review.ids.length) {
+      const payload = await responseJson(await fetch(`/api/items/ids?${queryParams(false)}`));
+      review.ids = payload.ids.map(String);
+      review.total = payload.total;
+      review.filterKey = key;
+    }
+    const wanted = String(id);
+    let index = review.ids.indexOf(wanted);
+    if (index < 0) {
+      review.ids = [wanted];
+      review.total = 1;
+      index = 0;
+    }
+    review.index = index;
+  }
+  function renderReviewToolbar(item, liveNote) {
+    const toolbar = qs("#review-toolbar");
+    toolbar.replaceChildren();
+    [
+      ["keep", "Keep"],
+      ["expected", "Expected"],
+      ["verify", "Verify"],
+      ["candidate", "Candidate"],
+      ["approved", "Approved"],
+    ].forEach(([value, label]) => {
+      const button = el("button", "button button-compact review-decision", label);
+      button.type = "button";
+      button.classList.toggle("is-active", item.review_decision === value);
+      button.addEventListener("click", () => saveReviewDecision(value, { advance: value === "keep" }));
+      toolbar.append(button);
+    });
+    const adminHref = safeLink(item.wp_admin_url);
+    if (adminHref) {
+      const admin = el("a", "button button-primary button-compact", item.live_state === "trashed" ? "Open Trash in WP" : "Open in WordPress");
+      admin.href = adminHref; admin.target = "_blank"; admin.rel = "noopener noreferrer"; toolbar.append(admin);
+    }
+    const liveHref = safeLink(item.live_link || item.url);
+    if (liveHref) {
+      const publicLink = el("a", "button button-outline button-compact", "Open public URL");
+      publicLink.href = liveHref; publicLink.target = "_blank"; publicLink.rel = "noopener noreferrer"; toolbar.append(publicLink);
+    }
+    if (writeEnabled && item.can_trash) {
+      const trash = el("button", "button button-danger button-compact", "Move to Trash");
+      trash.type = "button";
+      trash.addEventListener("click", () => trashCurrentRecord(trash));
+      toolbar.append(trash);
+    }
+    if (liveNote) toolbar.append(el("p", "review-live-note", liveNote));
+  }
+  function renderReviewBody(item) {
+    qs("#detail-title").textContent = item.title || item.file_name || "Untitled";
+    qs("#detail-kicker").textContent = reviewContext(item);
+    updateReviewNav();
+    const content = qs("#detail-content"); content.replaceChildren();
+    const finding = el("section", "detail-finding"), findingText = el("div");
+    findingText.append(el("strong", "", item.recommendation), el("p", "", item.reasons.join(" ")));
+    finding.append(badge(item.classification), findingText); content.append(finding);
+    if (item.expected_development) finding.append(badge("expected-development"));
+    const details = el("dl", "detail-grid");
+    detailField(details, "Content type", `${item.group_label} · ${humanize(item.content_class)}`);
+    detailField(details, "Status", humanize(item.status));
+    detailField(details, "Live WordPress", item.live_state ? `${humanize(item.live_state)}${item.live_status ? ` · ${humanize(item.live_status)}` : ""}` : "Not checked");
+    detailField(details, "Live check time", item.live_checked_at || "Not checked");
+    detailField(details, "Review decision", humanize(item.review_decision));
+    detailField(details, "Author", item.author_name || item.author_login || "Unknown");
+    detailField(details, "Author login", item.author_login);
+    detailField(details, "Published", item.created);
+    detailField(details, "Author email", item.author_email);
+    detailField(details, "Last updated", item.modified);
+    detailField(details, "Parent ID", item.parent_id === "0" ? "None" : item.parent_id);
+    detailField(details, "Inbound evidence", `${item.inbound_strong} strong · ${item.inbound_possible} possible · ${item.inbound_structural} structural`);
+    detailField(details, "Outbound references", String(item.outbound));
+    if (item.group === "media" || item.group === "documents") {
+      const previewUrl = safeLink(item.url), extension = (item.file_extension || "").toLowerCase();
+      const isImage = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"].includes(extension);
+      if (previewUrl) {
+        const preview = el("section", "media-review");
+        const previewPane = el("div", "media-preview");
+        if (isImage) {
+          const image = document.createElement("img");
+          image.src = previewUrl; image.alt = item.alt_text || item.title || "Media preview";
+          image.loading = "lazy"; image.referrerPolicy = "no-referrer";
+          image.addEventListener("error", () => { previewPane.replaceChildren(el("p", "muted", "Preview unavailable. The exported URL may be private or no longer reachable.")); });
+          previewPane.append(image);
+        } else previewPane.append(el("div", "file-preview-icon", fileTypeLabel(item.file_extension || "<none>")));
+        const previewInfo = el("div", "media-preview-info");
+        previewInfo.append(el("strong", "", isImage ? "Image preview" : "File preview"), el("span", "muted", isImage ? "Loaded from the exported attachment URL." : "Binary file is not included in the WXR export."));
+        if (previewUrl) { const link = el("a", "detail-link", "Open original"); link.href = previewUrl; link.target = "_blank"; link.rel = "noopener noreferrer"; previewInfo.append(link); }
+        preview.append(previewPane, previewInfo); content.append(preview);
       }
-      const liveHref = safeLink(item.live_link || item.url);
-      if (liveHref) { const publicLink = el("a", "button button-outline", "Open public URL"); publicLink.href = liveHref; publicLink.target = "_blank"; publicLink.rel = "noopener noreferrer"; actionsBar.append(publicLink); }
-      if (writeEnabled && item.can_trash) {
-        const trash = el("button", "button button-danger button-compact", "Move to Trash in WordPress");
-        trash.type = "button";
-        trash.addEventListener("click", async () => {
-          trash.disabled = true;
-          try {
-            await trashRecords([item.id], [item.title || item.file_name || `ID ${item.id}`]);
-            qs("#detail-dialog").close();
-          } catch (error) {
-            window.alert(error.message || "WordPress Trash failed.");
-            trash.disabled = false;
-          }
-        });
-        actionsBar.append(trash);
-      }
-      if (actionsBar.childNodes.length) content.append(actionsBar);
-      const details = el("dl", "detail-grid"); detailField(details, "Content type", `${item.group_label} · ${humanize(item.content_class)}`); detailField(details, "Status", humanize(item.status));
-      detailField(details, "Live WordPress", item.live_state ? `${humanize(item.live_state)}${item.live_status ? ` · ${humanize(item.live_status)}` : ""}` : "Not checked");
-      detailField(details, "Live check time", item.live_checked_at || "Not checked");
-      detailField(details, "Author", item.author_name || item.author_login || "Unknown"); detailField(details, "Author login", item.author_login); detailField(details, "Published", item.created);
-      detailField(details, "Author email", item.author_email); detailField(details, "Last updated", item.modified); detailField(details, "Parent ID", item.parent_id === "0" ? "None" : item.parent_id);
-      detailField(details, "Inbound evidence", `${item.inbound_strong} strong · ${item.inbound_possible} possible · ${item.inbound_structural} structural`); detailField(details, "Outbound references", String(item.outbound));
-      if (item.group === "media" || item.group === "documents") {
-        const previewUrl = safeLink(item.url), extension = (item.file_extension || "").toLowerCase();
-        const isImage = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"].includes(extension);
-        if (previewUrl) {
-          const preview = el("section", "media-review");
-          const previewPane = el("div", "media-preview");
-          if (isImage) { const image = document.createElement("img"); image.src = previewUrl; image.alt = item.alt_text || item.title || "Media preview"; image.loading = "lazy"; image.referrerPolicy = "no-referrer"; image.addEventListener("error", () => { previewPane.replaceChildren(el("p", "muted", "Preview unavailable. The exported URL may be private or no longer reachable.")); }); previewPane.append(image); }
-          else previewPane.append(el("div", "file-preview-icon", fileTypeLabel(item.file_extension || "<none>")));
-          const previewInfo = el("div", "media-preview-info"); previewInfo.append(el("strong", "", isImage ? "Image preview" : "File preview"), el("span", "muted", isImage ? "Loaded from the exported attachment URL." : "Binary file is not included in the WXR export."));
-          if (previewUrl) { const link = el("a", "detail-link", "Open original"); link.href = previewUrl; link.target = "_blank"; link.rel = "noopener noreferrer"; previewInfo.append(link); }
-          preview.append(previewPane, previewInfo); content.append(preview);
-        }
-        detailField(details, "File", item.file_name || item.url); detailField(details, "File type", fileTypeLabel(item.file_extension || "<none>")); detailField(details, "MIME type", item.mime_type || "Not exported"); detailField(details, "File size", formatBytes(item.file_size));
-        detailField(details, "Dimensions", item.width && item.height ? `${item.width} × ${item.height} px` : "Not exported"); detailField(details, "ALT text", item.alt_text || "Not set");
-        detailField(details, "Caption", item.caption || "Not set"); detailField(details, "Description", item.description || "Not set");
-        detailField(details, "Generated variants", String(item.derivative_count || 0)); detailField(details, "Stored path", item.stored_path || "Not exported"); }
-      detailField(details, "Exported meta keys", (item.meta_keys || []).join(", ") || "None");
-      content.append(details);
-      const taxonomies = Object.entries(item.taxonomy_terms || {});
-      if (taxonomies.length) { content.append(el("h3", "detail-section-title", "Taxonomies")); const list = el("div", "detail-taxonomies");
-        taxonomies.forEach(([key, values]) => { const group = el("div"); group.append(el("strong", "", taxonomyLabels[key] || humanize(key)), el("span", "", values.join(", "))); list.append(group); }); content.append(list); }
-      if (item.url) { const href = safeLink(item.url), link = href ? el("a", "detail-link", item.url) : el("span", "detail-link", item.url);
-        if (href) { link.href = href; link.target = "_blank"; link.rel = "noopener noreferrer"; } content.append(el("h3", "detail-section-title", "Exported URL"), link); }
-      content.append(el("h3", "detail-section-title", `Where-used evidence (${item.evidence.length})`));
-      if (!item.evidence.length) content.append(el("p", "muted", "No inbound evidence appears in the site export."));
-      else { const evidence = el("div", "evidence-list"); item.evidence.forEach((entry) => { const card = el("article", "evidence-card");
+      detailField(details, "File", item.file_name || item.url);
+      detailField(details, "File type", fileTypeLabel(item.file_extension || "<none>"));
+      detailField(details, "MIME type", item.mime_type || "Not exported");
+      detailField(details, "File size", formatBytes(item.file_size));
+      detailField(details, "Dimensions", item.width && item.height ? `${item.width} × ${item.height} px` : "Not exported");
+      detailField(details, "ALT text", item.alt_text || "Not set");
+      detailField(details, "Caption", item.caption || "Not set");
+      detailField(details, "Description", item.description || "Not set");
+      detailField(details, "Generated variants", String(item.derivative_count || 0));
+      detailField(details, "Stored path", item.stored_path || "Not exported");
+    }
+    detailField(details, "Exported meta keys", (item.meta_keys || []).join(", ") || "None");
+    content.append(details);
+    const taxonomies = Object.entries(item.taxonomy_terms || {});
+    if (taxonomies.length) {
+      content.append(el("h3", "detail-section-title", "Taxonomies"));
+      const list = el("div", "detail-taxonomies");
+      taxonomies.forEach(([key, values]) => {
+        const group = el("div"); group.append(el("strong", "", taxonomyLabels[key] || humanize(key)), el("span", "", values.join(", "))); list.append(group);
+      });
+      content.append(list);
+    }
+    if (item.url) {
+      const href = safeLink(item.url), link = href ? el("a", "detail-link", item.url) : el("span", "detail-link", item.url);
+      if (href) { link.href = href; link.target = "_blank"; link.rel = "noopener noreferrer"; }
+      content.append(el("h3", "detail-section-title", "Exported URL"), link);
+    }
+    content.append(el("h3", "detail-section-title", `Where-used evidence (${item.evidence.length})`));
+    if (!item.evidence.length) content.append(el("p", "muted", "No inbound evidence appears in the site export."));
+    else {
+      const evidence = el("div", "evidence-list");
+      item.evidence.forEach((entry) => {
+        const card = el("article", "evidence-card");
         card.append(el("strong", "", entry.source_title || `Source ${entry.source_id}`), el("span", "", `${humanize(entry.strength)} · ${humanize(entry.kind)} · ${entry.field}`));
-        if (entry.evidence) card.append(el("code", "", entry.evidence)); evidence.append(card); }); content.append(evidence); }
-      if (item.derivative_files?.length) { content.append(el("h3", "detail-section-title", `Generated media variants (${item.derivative_files.length})`)); const list = el("ul", "variant-list"); item.derivative_files.forEach((file) => list.append(el("li", "", file))); content.append(list); }
-    } catch (error) { qs("#detail-content").replaceChildren(el("p", "alert alert-error", error.message)); }
+        if (entry.evidence) card.append(el("code", "", entry.evidence));
+        evidence.append(card);
+      });
+      content.append(evidence);
+    }
+    if (item.derivative_files?.length) {
+      content.append(el("h3", "detail-section-title", `Generated media variants (${item.derivative_files.length})`));
+      const list = el("ul", "variant-list");
+      item.derivative_files.forEach((file) => list.append(el("li", "", file)));
+      content.append(list);
+    }
+  }
+  function liveNoteFor(item, extra) {
+    if (extra) return extra;
+    if (!restEnabled) return "";
+    if (item.live_state === "unchecked") return "Checking live WordPress for this record…";
+    if (writeEnabled && item.live_state === "found" && !item.can_trash) {
+      return "Mark Candidate or Approved to enable Trash. Keep and Trash stay on this sheet.";
+    }
+    if (item.live_state === "found" && item.can_trash) return "This record is live. Confirm Trash to move it to WordPress Trash.";
+    return "";
+  }
+  async function refreshCurrentItem() {
+    const id = review.ids[review.index];
+    const item = await responseJson(await fetch(`/api/items/${encodeURIComponent(id)}`));
+    review.item = item;
+    renderReviewBody(item);
+    renderReviewToolbar(item, liveNoteFor(item));
+    return item;
+  }
+  async function liveCheckCurrent(seq) {
+    const id = review.ids[review.index];
+    renderReviewToolbar(review.item, "Checking live WordPress for this record…");
+    try {
+      await responseJson(await fetch("/api/live-check", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: [id] }),
+      }));
+      if (seq !== review.seq) return;
+      await refreshCurrentItem();
+      loadItems();
+      loadQueueCount();
+    } catch (error) {
+      if (seq !== review.seq) return;
+      renderReviewToolbar(review.item, error.message || "Live WordPress check failed.");
+    }
+  }
+  async function saveReviewDecision(decision, options = {}) {
+    const item = review.item;
+    if (!item) return;
+    try {
+      await responseJson(await fetch(`/api/items/${encodeURIComponent(item.id)}/decision`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision }),
+      }));
+      await refreshCurrentItem();
+      loadItems();
+      if (options.advance) await goReview(1);
+    } catch (error) {
+      window.alert(error.message || "The review decision could not be saved.");
+    }
+  }
+  async function trashCurrentRecord(button) {
+    const item = review.item;
+    if (!item) return;
+    button.disabled = true;
+    try {
+      const ok = await trashRecords(
+        [item.id],
+        [item.title || item.file_name || `ID ${item.id}`],
+        { quiet: true, skipReload: true },
+      );
+      if (!ok) { button.disabled = false; return; }
+      updateSelectionUI();
+      await loadItems();
+      loadQueueCount();
+      if (review.index < review.ids.length - 1) await goReview(1);
+      else await refreshCurrentItem();
+    } catch (error) {
+      window.alert(error.message || "WordPress Trash failed.");
+      button.disabled = false;
+    }
+  }
+  async function showReviewRecord() {
+    const seq = ++review.seq;
+    const id = review.ids[review.index];
+    qs("#detail-title").textContent = "Loading record…";
+    qs("#detail-content").replaceChildren(el("p", "loading-copy", "Retrieving metadata and evidence…"));
+    qs("#review-toolbar").replaceChildren();
+    updateReviewNav();
+    try {
+      const item = await responseJson(await fetch(`/api/items/${encodeURIComponent(id)}`));
+      if (seq !== review.seq) return;
+      review.item = item;
+      renderReviewBody(item);
+      renderReviewToolbar(item, liveNoteFor(item));
+      if (restEnabled && (!item.live_state || item.live_state === "unchecked")) {
+        await liveCheckCurrent(seq);
+      }
+    } catch (error) {
+      if (seq !== review.seq) return;
+      qs("#detail-content").replaceChildren(el("p", "alert alert-error", error.message));
+    }
+  }
+  async function goReview(delta) {
+    const next = review.index + delta;
+    if (next < 0 || next >= review.ids.length) return;
+    review.index = next;
+    await showReviewRecord();
+  }
+  async function openDetails(id) {
+    review.open = true;
+    const dialog = qs("#detail-dialog");
+    qs("#detail-title").textContent = "Loading record…";
+    qs("#detail-kicker").textContent = "Review sheet";
+    qs("#detail-content").replaceChildren(el("p", "loading-copy", "Retrieving metadata and evidence…"));
+    qs("#review-toolbar").replaceChildren();
+    if (!dialog.open) dialog.showModal();
+    try {
+      await ensureReviewIds(id);
+      await showReviewRecord();
+    } catch (error) {
+      qs("#detail-content").replaceChildren(el("p", "alert alert-error", error.message));
+    }
   }
   async function loadTaxonomies() {
     const grid = qs("#taxonomy-grid"); grid.replaceChildren(el("p", "loading-copy", "Loading taxonomy assignments…"));
@@ -412,6 +611,7 @@
       [controls.classification, controls.status, controls.author, controls.subtype, controls.fileType, controls.decision].forEach((control) => { control.value = ""; });
       if (controls.live) controls.live.value = "";
     qs("#active-taxonomy-filter").hidden = true; qsa(".group-card").forEach((card) => card.classList.toggle("is-active", card.dataset.group === groupId));
+    review.filterKey = ""; review.ids = [];
     showPanel("content-panel"); renderGroupHeader(); loadItems(true); loadTaxonomies();
   }
   qsa(".group-card").forEach((card) => card.addEventListener("click", () => chooseGroup(card.dataset.group)));
@@ -423,6 +623,7 @@
       if (state.queue) qsa(".group-card").forEach((card) => card.classList.remove("is-active"));
       else qsa(".group-card").forEach((card) => card.classList.toggle("is-active", card.dataset.group === state.group));
       renderGroupHeader();
+      review.filterKey = ""; review.ids = [];
       loadItems(true);
     }
     showPanel(tab.dataset.panel);
@@ -434,25 +635,6 @@
     const response = await fetch("/api/audit", { method: "DELETE" });
     if (response.ok) window.location.assign("/");
     else window.alert("The stored audit could not be removed.");
-  });
-  qs("#live-check")?.addEventListener("click", async () => {
-    const button = qs("#live-check");
-    button.disabled = true;
-    button.textContent = "Checking WordPress…";
-    try {
-      const payload = await responseJson(await fetch("/api/live-check", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ group: state.queue ? "" : state.group }),
-      }));
-      window.alert(`Checked ${payload.checked.toLocaleString()} records in this group.\nFound live: ${payload.found}\nIn trash: ${payload.trashed || 0}\nMissing: ${payload.missing}\nNot in REST: ${payload.not_in_rest}\nErrors: ${payload.error}`);
-      loadItems();
-      loadQueueCount();
-    } catch (error) {
-      window.alert(error.message || "The live WordPress check failed.");
-    } finally {
-      button.disabled = false;
-      button.textContent = "Check this group live";
-    }
   });
   qs("#select-page")?.addEventListener("change", (event) => {
     qsa(".row-select").forEach((box) => {
@@ -477,10 +659,21 @@
       updateSelectionUI();
     }
   });
-  qs("#clear-taxonomy-filter").addEventListener("click", () => { state.taxonomy = ""; state.term = ""; state.page = 1; qs("#active-taxonomy-filter").hidden = true; loadItems(); });
+  qs("#clear-taxonomy-filter").addEventListener("click", () => { state.taxonomy = ""; state.term = ""; state.page = 1; review.filterKey = ""; review.ids = []; qs("#active-taxonomy-filter").hidden = true; loadItems(); });
   qs("#previous-page").addEventListener("click", () => { state.page -= 1; loadItems(); }); qs("#next-page").addEventListener("click", () => { state.page += 1; loadItems(); });
-  controls.search.addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { state.page = 1; loadItems(); }, 250); });
-  [controls.classification, controls.status, controls.author, controls.subtype, controls.fileType, controls.decision, controls.live, controls.sort, controls.pageSize].filter(Boolean).forEach((control) => control.addEventListener("change", () => { state.page = 1; loadItems(); }));
-  qs("#close-dialog").addEventListener("click", () => qs("#detail-dialog").close()); qs("#detail-dialog").addEventListener("click", (event) => { if (event.target === qs("#detail-dialog")) qs("#detail-dialog").close(); });
+  controls.search.addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { state.page = 1; review.filterKey = ""; review.ids = []; loadItems(); }, 250); });
+  [controls.classification, controls.status, controls.author, controls.subtype, controls.fileType, controls.decision, controls.live, controls.sort, controls.pageSize].filter(Boolean).forEach((control) => control.addEventListener("change", () => { state.page = 1; if (control !== controls.pageSize) { review.filterKey = ""; review.ids = []; } loadItems(); }));
+  qs("#review-prev").addEventListener("click", () => goReview(-1));
+  qs("#review-next").addEventListener("click", () => goReview(1));
+  qs("#close-dialog").addEventListener("click", () => qs("#detail-dialog").close());
+  qs("#detail-dialog").addEventListener("click", (event) => { if (event.target === qs("#detail-dialog")) qs("#detail-dialog").close(); });
+  qs("#detail-dialog").addEventListener("close", () => { review.open = false; review.seq += 1; });
+  document.addEventListener("keydown", (event) => {
+    if (!qs("#detail-dialog")?.open) return;
+    const tag = (event.target && event.target.tagName) || "";
+    if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+    if (event.key === "ArrowLeft" || event.key === "k" || event.key === "K") { event.preventDefault(); goReview(-1); }
+    else if (event.key === "ArrowRight" || event.key === "j" || event.key === "J") { event.preventDefault(); goReview(1); }
+  });
   renderGroupHeader(); loadItems(true); loadTaxonomies(); loadQueueCount();
 })();

@@ -29,6 +29,9 @@ def test_paginated_group_api_and_lazy_detail():
     assert listing["items"][0]["group"] == "pages"
     assert listing["items"][0]["live_state"] == "unchecked"
     assert "/wp-admin/post.php?post=" in listing["items"][0]["wp_admin_url"]
+    ids = client.get("/api/items/ids?group=pages").get_json()
+    assert ids["total"] == 3
+    assert ids["ids"] == [item["id"] for item in listing["items"]]
     detail = client.get("/api/items/3").get_json()
     assert detail["author_name"] == "Greg Crouch"
     assert detail["classification"] == "unreferenced"
@@ -141,6 +144,10 @@ def test_live_check_merges_read_only_wordpress_status(monkeypatch):
     assert listing["total"] == 1
     assert listing["items"][0]["id"] == "1"
     assert listing["items"][0]["live_status"] == "publish"
+    by_id = client.post("/api/live-check", json={"ids": ["1"]})
+    assert by_id.status_code == 200
+    assert by_id.get_json()["checked"] == 1
+    assert by_id.get_json()["found"] == 1
     exported = client.get("/api/export.csv?group=pages&live=missing")
     assert exported.status_code == 200
     assert b"wp_admin_url" in exported.data

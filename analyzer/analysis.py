@@ -256,6 +256,7 @@ def analyze_export(
     roots: set[str] = set()
     unresolved_internal: set[str] = set()
     incomplete_scans: set[str] = set()
+    unmatched_forms: Counter[str] = Counter()
     site_hosts = {
         urlsplit(normalized).hostname
         for normalized in (normalize_url(export.site_url), normalize_url(export.home_url))
@@ -403,9 +404,7 @@ def analyze_export(
                     continue
                 mapped_ids = forms_by_gform_id.get(form_id)
                 if not mapped_ids:
-                    export.warnings.append(
-                        f"Gravity Form {form_id} is referenced by item {item.id} but no exported post has _gform-form-id {form_id}."
-                    )
+                    unmatched_forms[form_id] += 1
                     continue
                 for target_id in mapped_ids:
                     add_reference(item.id, target_id, "gravityform", field_name, "possible", match.group(0))
@@ -636,6 +635,14 @@ def analyze_export(
     rows.sort(key=lambda row: (priority.get(row["classification"], 99), row["title"].casefold(), row["id"]))
 
     warnings = list(dict.fromkeys(export.warnings))
+    if unmatched_forms:
+        shortcode_count = sum(unmatched_forms.values())
+        form_count = len(unmatched_forms)
+        warnings.append(
+            f"{shortcode_count} Gravity Form shortcode{'s' if shortcode_count != 1 else ''} "
+            f"reference {form_count} plugin form ID{'s' if form_count != 1 else ''} with no matching "
+            "exported _gform-form-id post. Form definitions are not in the WXR."
+        )
     if menu_items:
         warnings.append(
             "Exported navigation items are treated as entry points; the export does not prove they are assigned to a live theme location."

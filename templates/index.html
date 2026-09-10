@@ -120,7 +120,6 @@
               <p id="active-group-description"></p>
             </div>
             <div class="workspace-actions">
-              {% if rest_enabled %}<button class="button button-primary" id="live-check" type="button">Check this group live</button>{% endif %}
               <a class="button button-outline" id="export-csv" href="/api/export.csv">Export CSV</a>
               <a class="button button-outline" id="export-json" href="/api/export.json">Export JSON</a>
             </div>
@@ -166,7 +165,7 @@
               <table>
                 <thead><tr>
                   {% if rest_write_enabled %}<th class="select-col"><label class="sr-only" for="select-page">Select page</label><input id="select-page" type="checkbox"></th>{% endif %}
-                  <th>Finding</th><th>Live</th><th>Content</th><th>Author</th><th>Taxonomies</th><th>Published</th><th>Last updated</th><th>Review</th><th><span class="sr-only">Details</span></th>
+                  <th>Finding</th><th>Live</th><th>Content</th><th>Author</th><th>Taxonomies</th><th>Published</th><th>Last updated</th><th>Review</th><th><span class="sr-only">Review sheet</span></th>
                 </tr></thead>
                 <tbody id="results-body"></tbody>
               </table>
@@ -211,8 +210,20 @@
   </main>
 
   <dialog id="detail-dialog" aria-labelledby="detail-title">
-    <header class="dialog-header"><div><p class="step" id="detail-kicker">Content evidence</p><h2 id="detail-title">Record detail</h2></div><button class="icon-button" id="close-dialog" type="button" aria-label="Close details">×</button></header>
+    <header class="dialog-header">
+      <div>
+        <p class="step" id="detail-kicker">Review sheet</p>
+        <h2 id="detail-title">Record detail</h2>
+      </div>
+      <div class="review-nav">
+        <button class="button button-outline button-compact" id="review-prev" type="button">Previous</button>
+        <span id="review-position">—</span>
+        <button class="button button-outline button-compact" id="review-next" type="button">Next</button>
+        <button class="icon-button" id="close-dialog" type="button" aria-label="Close review sheet">×</button>
+      </div>
+    </header>
     <div id="detail-content"></div>
+    <footer class="review-toolbar" id="review-toolbar"></footer>
   </dialog>
 
       <script id="runtime-data" type="application/json">{{ {'chunk_size': chunk_size, 'storage_mode': storage_mode, 'rest_enabled': rest_enabled, 'rest_write_enabled': rest_write_enabled, 'write_csrf': write_csrf}|tojson }}</script>

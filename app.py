@@ -469,6 +469,14 @@ def create_app() -> Flask:
             }
         )
 
+    @app.get("/api/items/ids")
+    def api_item_ids():
+        state = latest_state()
+        if not state:
+            return jsonify({"error": "No export has been analyzed."}), 404
+        rows = filtered_rows(state["report"])
+        return jsonify({"ids": [row["id"] for row in rows], "total": len(rows)})
+
     @app.get("/api/items/<item_id>")
     def api_item(item_id: str):
         state = latest_state()
@@ -519,13 +527,15 @@ def create_app() -> Flask:
             return jsonify({"error": "No export has been analyzed."}), 404
         data = request.get_json(silent=True) or {}
         group = str(data.get("group") or request.args.get("group") or "").strip()
+        raw_ids = data.get("ids") if isinstance(data.get("ids"), list) else []
+        wanted = {item_id for item_id in (wordpress_id(value) for value in raw_ids) if item_id}
         site = state["report"].get("site") or {}
         rest_url = os.environ.get("WP_REST_BASE_URL", "")
         if not sites_are_same([site.get("site_url") or "", site.get("home_url") or ""], rest_url):
             return jsonify({"error": "This export is not from the WordPress site configured for local REST."}), 409
         items = [
             row for row in state["report"]["items"]
-            if not group or row["group"] == group
+            if (not group or row["group"] == group) and (not wanted or row["id"] in wanted)
         ]
         try:
             site_url = site.get("site_url") or site.get("home_url") or ""
