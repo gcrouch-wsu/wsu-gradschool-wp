@@ -57,6 +57,21 @@ def test_review_decision_and_filtered_export():
     assert "evidence" in full_json[0]
 
 
+def test_review_decisions_use_simple_outcomes_and_normalize_legacy_values():
+    client = _client_with_report()
+    assert client.post("/api/items/3/decision", json={"decision": "candidate"}).status_code == 400
+    app = client.application
+    store = app.extensions["audit_store"]
+    with client.session_transaction() as sess:
+        audit_id = sess["audit_id"]
+    state = store.load_state(audit_id)
+    store.save_decisions(audit_id, {"3": "candidate", "2": "expected"}, expected_rev=state["decision_rev"])
+    assert client.get("/api/items/3").get_json()["review_decision"] == "verify"
+    assert client.get("/api/items/2").get_json()["review_decision"] == "keep"
+    facets = client.get("/api/items?group=pages").get_json()["facets"]["decisions"]
+    assert facets == ["approved", "keep", "unreviewed", "verify"]
+
+
 def test_chunked_upload_survives_separate_requests_and_can_be_removed():
     app = create_app()
     app.config.update(TESTING=True)
@@ -224,7 +239,7 @@ def test_confirmed_trash_updates_live_state(monkeypatch):
     assert missing_confirm.status_code == 400
     blocked = client.post("/api/trash", json={"ids": ["3"], "confirm": "trash", "csrf": _write_csrf(client)})
     assert blocked.status_code == 400
-    assert "candidate or approved" in blocked.get_json()["error"]
+    assert "approved to delete" in blocked.get_json()["error"]
     assert client.post("/api/live-check", json={"group": "pages"}).status_code == 200
     assert client.post("/api/items/3/decision", json={"decision": "approved"}).status_code == 200
     trashed = client.post("/api/trash", json={"ids": ["3"], "confirm": "trash", "csrf": _write_csrf(client)})
@@ -527,7 +542,7 @@ def test_successful_trash_writes_limited_action_metadata(monkeypatch):
     store = client.application.extensions["audit_store"]
     monkeypatch.setattr(store, "record_action", capture_action)
     assert client.post("/api/live-check", json={"ids": ["3"]}).status_code == 200
-    assert client.post("/api/items/3/decision", json={"decision": "candidate"}).status_code == 200
+    assert client.post("/api/items/3/decision", json={"decision": "approved"}).status_code == 200
     assert client.post(
         "/api/trash",
         json={"ids": ["3"], "confirm": "trash", "csrf": _write_csrf(client)},

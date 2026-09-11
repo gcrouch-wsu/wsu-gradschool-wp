@@ -159,7 +159,7 @@
             <div class="table-toolbar">
               <div>
                 <p id="result-count" aria-live="polite">Loading content…</p>
-                {% if rest_write_enabled %}<p class="trash-hint">Checkboxes and Trash stay locked until a record is found live and marked Candidate or Approved. Use the review sheet to do that.</p>{% endif %}
+                {% if rest_write_enabled %}<p class="trash-hint">Checkboxes unlock after the live WordPress check passes and you choose Approve to delete in the review card.</p>{% endif %}
               </div>
               <div class="table-toolbar-actions">
                 {% if rest_write_enabled %}

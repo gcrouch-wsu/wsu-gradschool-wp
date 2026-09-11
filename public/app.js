@@ -10,11 +10,11 @@
   };
   const labels = {
     unreferenced: "Unreferenced", "unreferenced-media": "Unreferenced media",
-    disconnected: "Disconnected island", "needs-verification": "Needs verification",
-    "expected-development": "Expected development", "non-public": "Non-public", linked: "Linked",
+    disconnected: "Disconnected island", "needs-verification": "Needs manual check",
+    "expected-development": "Development author", "non-public": "Non-public", linked: "Linked",
     publish: "Published", inherit: "Inherited", draft: "Draft", private: "Private", pending: "Pending",
-    unreviewed: "Unreviewed", keep: "Keep", expected: "Expected development", verify: "Verify",
-    candidate: "Deletion candidate", approved: "Approved to delete",
+    unreviewed: "Not reviewed", keep: "Keep", expected: "Keep", verify: "Review later",
+    candidate: "Review later", approved: "Approved to delete",
     unchecked: "Not checked", found: "Found live", trashed: "In trash", missing: "Missing live",
     "not-in-rest": "Not in REST", error: "Live check error",
   };
@@ -35,14 +35,14 @@
     if (!writeEnabled) return "WordPress Trash is not enabled for this environment.";
     if (item.live_checking) return "Wait for the fresh WordPress check to finish.";
     if (item.can_trash) return "";
-    if (item.live_state === "unchecked") return "Live-check this record first, then mark Candidate or Approved.";
+    if (item.live_state === "unchecked") return "Wait for the live WordPress check, then choose Approve to delete.";
     if (item.live_state === "missing") return "This record was not found on live WordPress.";
     if (item.live_state === "trashed") return "Already in WordPress Trash.";
     if (item.live_state === "not-in-rest") return "This content type cannot be trashed through WordPress REST.";
     if (item.live_state === "error") return "Live check failed, so Trash is blocked.";
     if (item.live_state === "found" && !item.live_snapshot_ready) return "WordPress did not return a complete version snapshot, so Trash is blocked.";
     if (item.live_snapshot_ready && !item.live_identity_matches) return "The live title or type differs from the export. Review a current export before Trash.";
-    if (!["candidate", "approved"].includes(item.review_decision)) return "Mark Candidate or Approved to enable Trash.";
+    if (item.review_decision !== "approved") return "Choose Approve to delete first.";
     return "Trash is not available for this record.";
   }
   function makeTrashButton(item, className) {
@@ -202,7 +202,7 @@
       Object.entries(group.related_records).map(([name, count]) => `${count.toLocaleString()} ${name.toLowerCase()}`).join(" · ") + ".";
     qs("#taxonomy-tab-count").textContent = group.taxonomy_count ? String(group.taxonomy_count) : "";
     strip.replaceChildren(summaryItem("Total", group.count, "Exported records"), summaryItem("Public", group.public, "Published or inherited"),
-      summaryItem("Review", group.review_candidates, "Needs attention"), summaryItem("Expected", group.expected_development, "Development content"),
+      summaryItem("Review", group.review_candidates, "Needs attention"), summaryItem("Dev author", group.expected_development, "Configured author match"),
       summaryItem("Linked", group.linked, "Evidence found"), summaryItem("Taxonomies", group.taxonomy_count, "Typed groupings"));
     qs(".group-note")?.remove();
     if (group.note) { const note = el("aside", "group-note"); note.append(el("strong", "", "Export limitation"), el("span", "", group.note)); strip.after(note); }
@@ -294,7 +294,7 @@
   }
   function reviewSelect(item) {
     const select = el("select", "review-select"); select.setAttribute("aria-label", `Review decision for ${item.title || "untitled item"}`);
-    ["unreviewed", "keep", "expected", "verify", "candidate", "approved"].forEach((value) => {
+    ["unreviewed", "keep", "verify", "approved"].forEach((value) => {
       const option = el("option", "", humanize(value)); option.value = value; option.selected = item.review_decision === value; select.append(option);
     });
     select.dataset.state = item.review_decision;
@@ -304,6 +304,8 @@
         const response = await fetch(`/api/items/${encodeURIComponent(item.id)}/decision`, { method: "POST", headers: csrfHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ decision: select.value }) });
         if (!response.ok) throw new Error("The review decision could not be saved.");
         select.dataset.state = select.value; select.classList.add("is-saved"); setTimeout(() => select.classList.remove("is-saved"), 900);
+        await loadItems();
+        loadQueueCount();
       } catch (error) { select.value = prior; window.alert(error.message); }
       finally { select.disabled = false; }
     });
@@ -366,7 +368,7 @@
       }
       renderRows(payload.items); qs("#result-count").textContent = `${payload.total.toLocaleString()} record${payload.total === 1 ? "" : "s"} in this view`;
       if (writeEnabled && !qs(".trash-hint")) {
-        qs("#result-count").after(el("p", "trash-hint", "Checkboxes and Trash stay locked until a record is found live and marked Candidate or Approved. Open Review to do that."));
+        qs("#result-count").after(el("p", "trash-hint", "Checkboxes unlock after the live WordPress check passes and you choose Approve to delete in the review card."));
       }
       if (state.queue) qs("#summary-strip").replaceChildren(summaryItem("In queue", payload.total, "Needs attention"));
       qs("#page-status").textContent = `Page ${payload.page.toLocaleString()} of ${payload.page_count.toLocaleString()}`;
@@ -409,12 +411,10 @@
     const toolbar = qs("#review-toolbar");
     toolbar.replaceChildren();
     const decisions = el("div", "review-decisions");
+    decisions.append(el("span", "review-outcome-label", "Review outcome"));
     [
       ["keep", "Keep"],
-      ["expected", "Expected"],
-      ["verify", "Verify"],
-      ["candidate", "Candidate"],
-      ["approved", "Approved"],
+      ["verify", "Review later"],
     ].forEach(([value, label]) => {
       const button = el("button", "button button-compact review-decision", label);
       button.type = "button";
@@ -448,7 +448,10 @@
       content.append(complete);
     } else if (restEnabled || writeEnabled) {
       const readiness = el("section", "review-readiness");
-      readiness.append(el("h3", "", "Trash readiness"));
+      readiness.append(
+        el("h3", "", "Move this record to Trash"),
+        el("p", "review-readiness-intro", "The app checks the live record before allowing this reversible WordPress action."),
+      );
       const checks = el("div", "review-checklist");
       const addCheck = (ready, label, detail) => {
         const row = el("div", `review-check ${ready ? "is-ready" : "is-pending"}`);
@@ -457,15 +460,36 @@
         if (detail) copy.append(el("small", "", detail));
         row.append(copy); checks.append(row);
       };
-      addCheck(restEnabled, "WordPress REST", restEnabled ? "Configured for this review session." : "Configure WordPress REST to check and trash records.");
-      addCheck(item.live_state === "found" && !item.live_checking, "Found on live WordPress", item.live_checking ? "Refreshing now…" : humanize(item.live_state || "unchecked"));
-      addCheck(Boolean(item.live_snapshot_ready) && !item.live_checking, "Fresh version snapshot", item.live_modified ? `Modified ${item.live_modified}` : "A version timestamp is required.");
-      addCheck(Boolean(item.live_identity_matches) && !item.live_checking, "Identity matches export", item.live_title ? `Live title: ${item.live_title}` : "WordPress did not return a title.");
-      addCheck(["candidate", "approved"].includes(item.review_decision), "Deletion decision", `Current decision: ${humanize(item.review_decision)}`);
+      addCheck(
+        item.live_state === "found" && !item.live_checking,
+        "Live WordPress check",
+        item.live_checking ? "Checking now…" : item.live_state === "found" ? "Record found." : humanize(item.live_state || "unchecked"),
+      );
+      addCheck(
+        Boolean(item.live_identity_matches) && !item.live_checking,
+        "Export matches the live record",
+        item.live_identity_matches ? "ID, type, title, and version are ready." : "Trash stays blocked when the record differs or the check is incomplete.",
+      );
+      addCheck(
+        item.review_decision === "approved",
+        "Approval",
+        item.review_decision === "approved" ? "Approved to delete." : "Choose Approve to delete below.",
+      );
       readiness.append(checks);
       if (writeEnabled) {
         const trashAction = el("div", "review-trash-action");
-        trashAction.append(makeTrashButton(item, "button button-danger"));
+        const approve = el(
+          "button",
+          `button button-approve-delete${item.review_decision === "approved" ? " is-active" : ""}`,
+          item.review_decision === "approved" ? "Approved to delete" : "Approve to delete",
+        );
+        approve.type = "button";
+        approve.disabled = Boolean(item.live_checking || item.review_decision === "approved");
+        approve.addEventListener("click", async () => {
+          approve.disabled = true;
+          if (!await saveReviewDecision("approved")) approve.disabled = false;
+        });
+        trashAction.append(approve, makeTrashButton(item, "button button-danger"));
         const reason = trashReason(item);
         if (reason) trashAction.append(el("small", "", reason));
         readiness.append(trashAction);
@@ -630,7 +654,7 @@
   }
   async function saveReviewDecision(decision, options = {}) {
     const item = review.item;
-    if (!item) return;
+    if (!item) return false;
     try {
       await responseJson(await fetch(`/api/items/${encodeURIComponent(item.id)}/decision`, {
         method: "POST", headers: csrfHeaders({ "Content-Type": "application/json" }),
@@ -639,8 +663,10 @@
       await refreshCurrentItem();
       loadItems();
       if (options.advance) await goReview(1);
+      return true;
     } catch (error) {
       window.alert(error.message || "The review decision could not be saved.");
+      return false;
     }
   }
   async function trashCurrentRecord(button) {

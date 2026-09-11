@@ -79,7 +79,7 @@ The export contains non-public content and author metadata. Do not operate this 
 2. Redeploy the latest commit so the Blob environment variable and Flask secret are present.
 3. Confirm an unrecognized email and a wrong password both fail with the same message.
 4. Sign in and upload a small, fresh WordPress export first.
-5. Open a disposable record, mark it Candidate, confirm the live identity/version checklist completes, and move it to Trash from the review sheet.
+5. Open a disposable record, wait for the live check, choose **Approve to delete**, and move it to Trash from the same review card.
 6. Restore the disposable record in WordPress, then repeat with two disposable records using the table checkboxes and **Move selected to Trash**.
 7. Confirm Preview deployments show REST as read-only and cannot move records to Trash.
 8. Upload the full Graduate School export and confirm that Pages, Media, taxonomies, details, and exports load. Do not use a historical record count as a deployment health check.

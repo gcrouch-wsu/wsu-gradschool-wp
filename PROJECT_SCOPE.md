@@ -22,7 +22,7 @@ The working application now:
 - Identifies expected development content using configurable Greg Crouch author aliases without replacing the underlying finding.
 - Provides server-side search, filters, pagination, taxonomy drill-down, record details, per-audit review decisions, a cross-group work queue, and filtered CSV/JSON exports.
 - Requires an exact configured WSU email and app-specific password; each audit is bound to its signed-in reviewer.
-- Refreshes an opened review record from live WordPress REST and can move one record from the review sheet or up to 25 selected records to Trash after confirmation. Trash uses WordPress `DELETE` without `force`, requires a complete fresh live snapshot plus candidate/approved review, rejects version drift, and is authentication-, CSRF-, site-, and origin-gated.
+- Refreshes an opened review record from live WordPress REST and can move one record from the review sheet or up to 25 selected records to Trash after confirmation. Trash uses WordPress `DELETE` without `force`, requires a complete fresh live snapshot plus an Approved to delete outcome, rejects version drift, and is authentication-, CSRF-, site-, and origin-gated.
 - Marks published Events Calendar and graduate factsheet records as needing verification from an assumed public archive; it does not treat that archive as proven reachability.
 - Escapes displayed content and protects CSV cells from spreadsheet formula injection.
 
@@ -79,9 +79,9 @@ The intended workflow is:
 1. Select a content group.
 2. Filter by finding, status, author, subtype, taxonomy term, or search text.
 3. Open the review sheet; when REST is configured, it refreshes the record and compares the export with live identity and version fields.
-4. Assign a review decision: Keep, Expected Development, Verify, Deletion Candidate, or Approved to Delete.
-5. For Candidate or Approved records with a complete matching live snapshot, confirm Move to Trash directly in the review sheet.
-6. Export the current filtered view to CSV or JSON, or use the work queue to review unreferenced records, live-missing records, and deletion candidates.
+4. Assign one plain-language review outcome: Keep, Review later, or Approve to delete.
+5. For an Approved to delete record with a complete matching live snapshot, confirm Move to Trash in the same review card.
+6. Export the current filtered view to CSV or JSON, or use the work queue to review unreferenced records, live-missing records, and approved records.
 
 With REST write access explicitly enabled, the app can move selected records to WordPress Trash after an explicit confirmation. Vercel additionally requires the Production environment and `WP_REST_REMOTE_WRITE_ENABLED=1`; Preview stays read-only. It never force-deletes. Restore remains a WordPress admin action.
 

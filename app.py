@@ -31,7 +31,8 @@ MAX_UPLOAD_CHUNKS = (MAX_UPLOAD_BYTES + UPLOAD_CHUNK_BYTES - 1) // UPLOAD_CHUNK_
 AUDIT_TTL_SECONDS = 48 * 60 * 60
 LOGIN_WINDOW_SECONDS = 15 * 60
 MAX_LOGIN_FAILURES = 5
-REVIEW_DECISIONS = {"unreviewed", "keep", "expected", "verify", "candidate", "approved"}
+REVIEW_DECISIONS = {"unreviewed", "keep", "verify", "approved"}
+LEGACY_REVIEW_DECISIONS = {"expected": "keep", "candidate": "verify"}
 FINDING_PRIORITY = {
     "unreferenced": 0,
     "unreferenced-media": 1,
@@ -306,12 +307,15 @@ def create_app() -> Flask:
             if group and row["group"] != group:
                 continue
             live_state = (live.get(row["id"]) or {}).get("live_state") or "unchecked"
-            row_decision = decisions.get(row["id"], "unreviewed")
+            row_decision = LEGACY_REVIEW_DECISIONS.get(
+                decisions.get(row["id"], "unreviewed"),
+                decisions.get(row["id"], "unreviewed"),
+            )
             findings = {row["classification"], row.get("underlying_classification") or row["classification"]}
             if queue_mode and (
                 findings.isdisjoint(QUEUE_FINDINGS)
                 and live_state not in QUEUE_LIVE_STATES
-                and row_decision not in {"candidate", "approved"}
+                and row_decision != "approved"
             ):
                 continue
             if classification == "expected-development":
@@ -374,7 +378,8 @@ def create_app() -> Flask:
             "outbound", "expected_development", "derivative_count",
         )
         payload = {field: row.get(field) for field in fields}
-        payload["review_decision"] = decisions.get(row["id"], "unreviewed")
+        stored_decision = decisions.get(row["id"], "unreviewed")
+        payload["review_decision"] = LEGACY_REVIEW_DECISIONS.get(stored_decision, stored_decision)
         record = live.get(row["id"]) or {}
         payload["live_state"] = record.get("live_state") or "unchecked"
         payload["live_status"] = record.get("live_status") or ""
@@ -388,7 +393,7 @@ def create_app() -> Flask:
         payload["live_identity_matches"] = live_identity_matches(row, record)
         payload["can_trash"] = bool(
             payload["live_identity_matches"]
-            and payload["review_decision"] in {"candidate", "approved"}
+            and payload["review_decision"] == "approved"
         )
         if record.get("wp_admin_url"):
             payload["wp_admin_url"] = record["wp_admin_url"]
@@ -396,7 +401,8 @@ def create_app() -> Flask:
 
     def merge_live(row: dict, decisions: dict[str, str], live: dict[str, dict]) -> dict:
         exported = dict(row)
-        exported["review_decision"] = decisions.get(row["id"], "unreviewed")
+        stored_decision = decisions.get(row["id"], "unreviewed")
+        exported["review_decision"] = LEGACY_REVIEW_DECISIONS.get(stored_decision, stored_decision)
         record = live.get(row["id"]) or {}
         exported["live_state"] = record.get("live_state") or "unchecked"
         exported["live_status"] = record.get("live_status") or ""
@@ -411,7 +417,7 @@ def create_app() -> Flask:
         exported["live_identity_matches"] = live_identity_matches(row, record)
         exported["can_trash"] = bool(
             exported["live_identity_matches"]
-            and exported["review_decision"] in {"candidate", "approved"}
+            and exported["review_decision"] == "approved"
         )
         if record.get("wp_admin_url"):
             exported["wp_admin_url"] = record["wp_admin_url"]
@@ -808,13 +814,16 @@ def create_app() -> Flask:
         not_ready = [
             item_id for item_id in ids
             if not live_identity_matches(by_id[item_id], state["live"].get(item_id) or {})
-            or state["decisions"].get(item_id) not in {"candidate", "approved"}
+            or LEGACY_REVIEW_DECISIONS.get(
+                state["decisions"].get(item_id, "unreviewed"),
+                state["decisions"].get(item_id, "unreviewed"),
+            ) != "approved"
         ]
         if not_ready:
             return jsonify({
                 "error": (
-                    f"Record {not_ready[0]} needs a complete fresh live check that matches the export and must be marked "
-                    "candidate or approved before Trash."
+                    f"Record {not_ready[0]} needs a complete fresh live check that matches the export and must be "
+                    "approved to delete before Trash."
                 )
             }), 400
         unsupported = [item_id for item_id in ids if not rest_base_for(by_id[item_id].get("type", ""))]
