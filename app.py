@@ -31,6 +31,7 @@ MAX_UPLOAD_CHUNKS = (MAX_UPLOAD_BYTES + UPLOAD_CHUNK_BYTES - 1) // UPLOAD_CHUNK_
 AUDIT_TTL_SECONDS = 48 * 60 * 60
 LOGIN_WINDOW_SECONDS = 15 * 60
 MAX_LOGIN_FAILURES = 5
+TRASH_PREFLIGHT_TTL_SECONDS = 5 * 60
 REVIEW_DECISIONS = {"unreviewed", "keep", "verify", "approved"}
 LEGACY_REVIEW_DECISIONS = {"expected": "keep", "candidate": "verify"}
 FINDING_PRIORITY = {
@@ -250,6 +251,24 @@ def create_app() -> Flask:
             and live_title.casefold() == export_title.casefold()
         )
 
+    def bulk_trash_block_reason(row: dict, record: dict) -> str:
+        if not rest_base_for(row.get("type", "")):
+            return "This content type cannot be moved to Trash through WordPress REST."
+        live_state = str(record.get("live_state") or "unchecked")
+        if live_state == "missing":
+            return "This record was not found in live WordPress."
+        if live_state == "trashed":
+            return "This record is already in WordPress Trash."
+        if live_state == "not-in-rest":
+            return "This content type is not available through WordPress REST."
+        if live_state == "error":
+            return str(record.get("error") or "The live WordPress check failed.")
+        if not live_snapshot_ready(row, record):
+            return "WordPress did not return a complete current record snapshot."
+        if not live_identity_matches(row, record):
+            return "The live title or type differs from the export."
+        return ""
+
     def record_trash_results(audit_id: str, site_url: str, items: list[dict], results: list[dict]) -> None:
         by_id = {str(item.get("id") or ""): item for item in items}
         attempted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -395,6 +414,10 @@ def create_app() -> Flask:
             payload["live_identity_matches"]
             and payload["review_decision"] == "approved"
         )
+        payload["selectable_for_trash"] = bool(
+            rest_base_for(row.get("type", ""))
+            and payload["live_state"] != "trashed"
+        )
         if record.get("wp_admin_url"):
             payload["wp_admin_url"] = record["wp_admin_url"]
         return payload
@@ -418,6 +441,10 @@ def create_app() -> Flask:
         exported["can_trash"] = bool(
             exported["live_identity_matches"]
             and exported["review_decision"] == "approved"
+        )
+        exported["selectable_for_trash"] = bool(
+            rest_base_for(row.get("type", ""))
+            and exported["live_state"] != "trashed"
         )
         if record.get("wp_admin_url"):
             exported["wp_admin_url"] = record["wp_admin_url"]
@@ -775,6 +802,90 @@ def create_app() -> Flask:
         }
         return jsonify({"ok": True, "group": group, **counts})
 
+    @app.post("/api/trash/preflight")
+    def api_trash_preflight():
+        if not write_available():
+            return jsonify({"error": "WordPress Trash is not enabled for this environment."}), 403
+        if not write_request_allowed():
+            return jsonify({"error": "WordPress Trash requires an authenticated same-origin request."}), 403
+        if not secrets.compare_digest(request_csrf_token(), str(session.get("write_csrf") or "")):
+            return jsonify({"error": "Refresh the page and review the selection again."}), 403
+        state = latest_state()
+        if not state:
+            return jsonify({"error": "No export has been analyzed."}), 404
+        data = request.get_json(silent=True) or {}
+        raw_ids = data.get("ids") or []
+        if not isinstance(raw_ids, list):
+            return jsonify({"error": "Choose one or more records to review for Trash."}), 400
+        ids = []
+        for raw_id in raw_ids:
+            safe_id = wordpress_id(raw_id)
+            if not safe_id:
+                return jsonify({"error": "Each record ID must be a positive WordPress ID."}), 400
+            ids.append(safe_id)
+        if not ids:
+            return jsonify({"error": "Choose one or more records to review for Trash."}), 400
+        if len(ids) > MAX_TRASH_BATCH:
+            return jsonify({"error": f"Review at most {MAX_TRASH_BATCH} records for Trash at a time."}), 400
+        if len(set(ids)) != len(ids):
+            return jsonify({"error": "Each record can be included only once."}), 400
+        by_id = {row["id"]: row for row in state["report"]["items"]}
+        missing = [item_id for item_id in ids if item_id not in by_id]
+        if missing:
+            return jsonify({"error": f"Unknown record ID: {missing[0]}."}), 404
+        site = state["report"].get("site") or {}
+        site_url = export_site_url(site)
+        rest_url = os.environ.get("WP_REST_BASE_URL", "")
+        if not export_matches_rest(site, rest_url):
+            return jsonify({"error": "This export is not from the WordPress site configured for REST writes."}), 409
+        items = [by_id[item_id] for item_id in ids]
+        try:
+            results = live_check_items(items, client_from_env(), site_url=site_url)
+        except PermissionError as exc:
+            return jsonify({"error": str(exc)}), 403
+        except Exception:
+            app.logger.exception("WordPress REST bulk Trash preflight failed")
+            return jsonify({"error": "The fresh WordPress check for this selection failed."}), 500
+        live = dict(state["live"])
+        live.update(results)
+        try:
+            audit_store.save_live(session["audit_id"], live, expected_rev=state.get("live_rev"))
+        except RevisionConflict:
+            return jsonify({"error": "Another live check was saved first. Reload and review the selection again."}), 409
+
+        ready = []
+        blocked = []
+        for item in items:
+            record = results.get(item["id"]) or {}
+            title = str(item.get("title") or item.get("file_name") or f"ID {item['id']}")
+            reason = bulk_trash_block_reason(item, record)
+            target = {"id": item["id"], "title": title}
+            if reason:
+                target["reason"] = reason
+                blocked.append(target)
+            else:
+                ready.append(target)
+
+        token = ""
+        if ready:
+            token = secrets.token_urlsafe(32)
+            session["trash_preflight"] = {
+                "token": token,
+                "audit_id": session.get("audit_id"),
+                "user_email": current_user_email(),
+                "ids": [item["id"] for item in ready],
+                "expires_at": time.time() + TRASH_PREFLIGHT_TTL_SECONDS,
+            }
+        else:
+            session.pop("trash_preflight", None)
+        return jsonify({
+            "ok": True,
+            "site_url": site_url,
+            "ready": ready,
+            "blocked": blocked,
+            "preflight_token": token,
+        })
+
     @app.post("/api/trash")
     def api_trash():
         if not write_available():
@@ -802,6 +913,8 @@ def create_app() -> Flask:
             return jsonify({"error": "Choose one or more records to move to Trash."}), 400
         if len(ids) > MAX_TRASH_BATCH:
             return jsonify({"error": f"Move at most {MAX_TRASH_BATCH} records to Trash at a time."}), 400
+        if len(set(ids)) != len(ids):
+            return jsonify({"error": "Each record can be included only once."}), 400
         by_id = {row["id"]: row for row in state["report"]["items"]}
         missing = [item_id for item_id in ids if item_id not in by_id]
         if missing:
@@ -811,19 +924,41 @@ def create_app() -> Flask:
         rest_url = os.environ.get("WP_REST_BASE_URL", "")
         if not export_matches_rest(site, rest_url):
             return jsonify({"error": "This export is not from the WordPress site configured for REST writes."}), 409
-        not_ready = [
+        not_live_ready = [
             item_id for item_id in ids
             if not live_identity_matches(by_id[item_id], state["live"].get(item_id) or {})
-            or LEGACY_REVIEW_DECISIONS.get(
+        ]
+        if not_live_ready:
+            return jsonify({
+                "error": f"Record {not_live_ready[0]} needs a complete fresh live check that matches the export."
+            }), 400
+        unapproved = [
+            item_id for item_id in ids
+            if LEGACY_REVIEW_DECISIONS.get(
                 state["decisions"].get(item_id, "unreviewed"),
                 state["decisions"].get(item_id, "unreviewed"),
             ) != "approved"
         ]
-        if not_ready:
+        preflight_token = str(data.get("preflight_token") or "")
+        preflight_confirmed = False
+        if preflight_token:
+            preflight = session.pop("trash_preflight", None) or {}
+            stored_token = str(preflight.get("token") or "")
+            preflight_confirmed = bool(
+                stored_token
+                and secrets.compare_digest(preflight_token, stored_token)
+                and preflight.get("audit_id") == session.get("audit_id")
+                and preflight.get("user_email") == current_user_email()
+                and preflight.get("ids") == ids
+                and float(preflight.get("expires_at") or 0) >= time.time()
+            )
+            if not preflight_confirmed:
+                return jsonify({"error": "The bulk Trash review expired or does not match these records. Review the selection again."}), 403
+        if unapproved and not preflight_confirmed:
             return jsonify({
                 "error": (
-                    f"Record {not_ready[0]} needs a complete fresh live check that matches the export and must be "
-                    "approved to delete before Trash."
+                    f"Record {unapproved[0]} must be approved to delete in its review card or included in a "
+                    "completed bulk Trash review."
                 )
             }), 400
         unsupported = [item_id for item_id in ids if not rest_base_for(by_id[item_id].get("type", ""))]

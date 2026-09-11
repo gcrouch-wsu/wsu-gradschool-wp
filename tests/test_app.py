@@ -239,8 +239,11 @@ def test_confirmed_trash_updates_live_state(monkeypatch):
     assert missing_confirm.status_code == 400
     blocked = client.post("/api/trash", json={"ids": ["3"], "confirm": "trash", "csrf": _write_csrf(client)})
     assert blocked.status_code == 400
-    assert "approved to delete" in blocked.get_json()["error"]
+    assert "fresh live check" in blocked.get_json()["error"]
     assert client.post("/api/live-check", json={"group": "pages"}).status_code == 200
+    unapproved = client.post("/api/trash", json={"ids": ["3"], "confirm": "trash", "csrf": _write_csrf(client)})
+    assert unapproved.status_code == 400
+    assert "approved to delete" in unapproved.get_json()["error"]
     assert client.post("/api/items/3/decision", json={"decision": "approved"}).status_code == 200
     trashed = client.post("/api/trash", json={"ids": ["3"], "confirm": "trash", "csrf": _write_csrf(client)})
     assert trashed.status_code == 200
@@ -254,6 +257,80 @@ def test_confirmed_trash_updates_live_state(monkeypatch):
     assert listing["items"][0]["can_trash"] is False
     hostile = client.post("/api/trash", json={"ids": ["3?force=true"], "confirm": "trash", "csrf": _write_csrf(client)})
     assert hostile.status_code == 400
+
+
+def test_bulk_trash_preflight_allows_selection_without_prior_approval(monkeypatch):
+    deleted = []
+
+    def fake_live_check(items, _client, site_url):
+        assert site_url.rstrip("/") == "https://example.test"
+        return {
+            item["id"]: {
+                "live_state": "found",
+                "live_found": True,
+                "live_status": "publish",
+                "live_type": item["type"],
+                "live_title": item["title"],
+                "live_link": item["url"],
+                "live_modified": "2026-01-02T00:00:00",
+                "checked_at": "2026-09-11T12:00:00+00:00",
+            }
+            for item in items
+        }
+
+    def fake_trash(items, _client, site_url, expected_live):
+        assert site_url.rstrip("/") == "https://example.test"
+        assert all(expected_live[item["id"]]["live_state"] == "found" for item in items)
+        deleted.extend(item["id"] for item in items)
+        return [
+            {
+                "id": item["id"],
+                "title": item["title"],
+                "ok": True,
+                "live": {
+                    "live_state": "trashed",
+                    "live_found": True,
+                    "live_status": "trash",
+                    "live_type": item["type"],
+                    "live_title": item["title"],
+                    "live_modified": "2026-01-02T00:00:00",
+                    "checked_at": "2026-09-11T12:00:01+00:00",
+                },
+            }
+            for item in items
+        ]
+
+    monkeypatch.setenv("WP_REST_ALLOW_IN_TESTS", "1")
+    monkeypatch.setenv("WP_REST_ENABLED", "1")
+    monkeypatch.setenv("WP_REST_WRITE_ENABLED", "1")
+    monkeypatch.setenv("WP_REST_BASE_URL", "https://example.test")
+    monkeypatch.setenv("WP_REST_USERNAME", "gcrouch")
+    monkeypatch.setenv("WP_REST_APPLICATION_PASSWORD", "not-a-real-password")
+    monkeypatch.setattr("app.live_check_items", fake_live_check)
+    monkeypatch.setattr("app.trash_items", fake_trash)
+
+    client = _client_with_report()
+    row = client.get("/api/items?group=pages").get_json()["items"][0]
+    assert row["review_decision"] == "unreviewed"
+    assert row["can_trash"] is False
+    assert row["selectable_for_trash"] is True
+
+    csrf = _write_csrf(client)
+    preflight = client.post("/api/trash/preflight", json={"ids": [row["id"]], "csrf": csrf})
+    assert preflight.status_code == 200
+    reviewed = preflight.get_json()
+    assert [item["id"] for item in reviewed["ready"]] == [row["id"]]
+    assert reviewed["blocked"] == []
+    assert reviewed["preflight_token"]
+
+    trashed = client.post("/api/trash", json={
+        "ids": [row["id"]],
+        "confirm": "trash",
+        "csrf": csrf,
+        "preflight_token": reviewed["preflight_token"],
+    })
+    assert trashed.status_code == 200
+    assert deleted == [row["id"]]
 
 
 def test_trash_refuses_export_from_a_different_site(monkeypatch):
@@ -463,7 +540,7 @@ def test_write_enabled_dashboard_renders_bulk_selection_controls(monkeypatch):
     assert page.status_code == 200
     assert b'id="select-page"' in page.data
     assert b'id="bulk-trash"' in page.data
-    assert b"Move selected to Trash" in page.data
+    assert b"Review selected for Trash" in page.data
     assert b'"rest_write_enabled": true' in page.data
 
 

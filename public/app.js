@@ -45,6 +45,12 @@
     if (item.review_decision !== "approved") return "Choose Approve to delete first.";
     return "Trash is not available for this record.";
   }
+  function trashSelectionReason(item) {
+    if (!writeEnabled) return "WordPress Trash is not enabled for this environment.";
+    if (item.live_state === "trashed") return "Already in WordPress Trash.";
+    if (!item.selectable_for_trash) return "This content type cannot be moved to Trash through WordPress REST.";
+    return "";
+  }
   function makeTrashButton(item, className) {
     const button = el("button", className || "button button-danger button-compact", "Move to Trash");
     button.type = "button";
@@ -252,17 +258,24 @@
       window.alert("Move at most 25 records to Trash at a time.");
       return false;
     }
-    const preview = titles.slice(0, 8).join("\n");
-    const extra = titles.length > 8 ? `\n…and ${titles.length - 8} more` : "";
-    const site = dashboard.site?.site_url || dashboard.site?.home_url || "the configured WordPress site";
-    const confirmed = window.confirm(
-      `Move ${ids.length} record${ids.length === 1 ? "" : "s"} to Trash in live WordPress?\n\nSite: ${site}\nThis can be undone in WordPress Trash. It is not a permanent delete.\n\n${preview}${extra}`,
-    );
-    if (!confirmed) return false;
+    if (!options.skipConfirm) {
+      const preview = titles.slice(0, 8).join("\n");
+      const extra = titles.length > 8 ? `\n…and ${titles.length - 8} more` : "";
+      const site = dashboard.site?.site_url || dashboard.site?.home_url || "the configured WordPress site";
+      const confirmed = window.confirm(
+        `Move ${ids.length} record${ids.length === 1 ? "" : "s"} to Trash in live WordPress?\n\nSite: ${site}\nThis can be undone in WordPress Trash. It is not a permanent delete.\n\n${preview}${extra}`,
+      );
+      if (!confirmed) return false;
+    }
     const payload = await responseJson(await fetch("/api/trash", {
       method: "POST",
       headers: csrfHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ ids, confirm: "trash", csrf: runtime.write_csrf || "" }),
+      body: JSON.stringify({
+        ids,
+        confirm: "trash",
+        csrf: runtime.write_csrf || "",
+        preflight_token: options.preflightToken || "",
+      }),
     }));
     payload.results.filter((result) => result.ok).forEach((result) => selected.delete(result.id));
     const failed = payload.results.filter((result) => !result.ok);
@@ -277,6 +290,44 @@
       loadQueueCount();
     }
     return failed.length === 0 && payload.trashed === ids.length;
+  }
+  async function reviewBulkTrash(items) {
+    if (!items.length) return false;
+    if (items.length > 25) {
+      window.alert("Review at most 25 records for Trash at a time.");
+      return false;
+    }
+    const preflight = await responseJson(await fetch("/api/trash/preflight", {
+      method: "POST",
+      headers: csrfHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ ids: items.map((item) => item.id), csrf: runtime.write_csrf || "" }),
+    }));
+    const ready = preflight.ready || [];
+    const blocked = preflight.blocked || [];
+    const blockedPreview = blocked.slice(0, 8).map((item) => `${item.title}: ${item.reason}`).join("\n");
+    const blockedExtra = blocked.length > 8 ? `\n…and ${blocked.length - 8} more blocked` : "";
+    if (!ready.length) {
+      window.alert(`No selected records are ready for Trash.${blocked.length ? `\n\n${blockedPreview}${blockedExtra}` : ""}`);
+      return false;
+    }
+    const readyPreview = ready.slice(0, 8).map((item) => item.title).join("\n");
+    const readyExtra = ready.length > 8 ? `\n…and ${ready.length - 8} more ready` : "";
+    const site = preflight.site_url || dashboard.site?.site_url || dashboard.site?.home_url || "the configured WordPress site";
+    const confirmed = window.confirm(
+      `Fresh WordPress check complete.\n\nReady to move: ${ready.length}\nBlocked: ${blocked.length}\n\nSite: ${site}\nThis can be undone in WordPress Trash. It is not a permanent delete.\n\nReady:\n${readyPreview}${readyExtra}${blocked.length ? `\n\nBlocked:\n${blockedPreview}${blockedExtra}` : ""}\n\nMove the ready records to Trash?`,
+    );
+    if (!confirmed) return false;
+    const completed = await trashRecords(
+      ready.map((item) => item.id),
+      ready.map((item) => item.title),
+      { preflightToken: preflight.preflight_token, quiet: true, skipConfirm: true },
+    );
+    if (completed && blocked.length) {
+      window.alert(`Moved ${ready.length} record${ready.length === 1 ? "" : "s"} to Trash.\n${blocked.length} blocked record${blocked.length === 1 ? " remains" : "s remain"} selected for review.`);
+    } else if (completed) {
+      window.alert(`Moved ${ready.length} record${ready.length === 1 ? "" : "s"} to WordPress Trash.`);
+    }
+    return completed;
   }
   const badge = (value) => el("span", `badge badge-${value}`, humanize(value));
   const meta = (text) => el("small", "content-meta", text || "—");
@@ -337,10 +388,10 @@
         box.type = "checkbox";
         box.dataset.id = item.id;
         box.dataset.title = item.title || item.file_name || `ID ${item.id}`;
-        if (selected.has(item.id) && !item.can_trash) selected.delete(item.id);
+        if (selected.has(item.id) && !item.selectable_for_trash) selected.delete(item.id);
         box.checked = selected.has(item.id);
-        box.disabled = !item.can_trash;
-        box.title = box.disabled ? trashReason(item) : "Select this record for bulk Trash";
+        box.disabled = !item.selectable_for_trash;
+        box.title = box.disabled ? trashSelectionReason(item) : "Select this record for bulk Trash review";
         box.setAttribute("aria-label", `Select ${item.title || item.file_name || item.id}`);
         box.addEventListener("change", () => {
           if (box.checked) selected.set(item.id, item);
@@ -785,7 +836,7 @@
       box.checked = event.target.checked;
       const itemId = box.dataset.id;
       if (!itemId) return;
-      if (box.checked) selected.set(itemId, { id: itemId, title: box.dataset.title || itemId, can_trash: true });
+      if (box.checked) selected.set(itemId, { id: itemId, title: box.dataset.title || itemId, selectable_for_trash: true });
       else selected.delete(itemId);
     });
     updateSelectionUI();
@@ -795,7 +846,7 @@
     const button = qs("#bulk-trash");
     button.disabled = true;
     try {
-      await trashRecords(items.map((item) => item.id), items.map((item) => item.title || item.file_name || `ID ${item.id}`));
+      await reviewBulkTrash(items);
     } catch (error) {
       window.alert(error.message || "WordPress Trash failed.");
     } finally {
