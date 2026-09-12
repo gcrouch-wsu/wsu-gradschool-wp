@@ -49,7 +49,7 @@ Optional: add `WP_EXPECTED_DEVELOPMENT_AUTHORS` if the default `greg crouch,gcro
 
 ## 4. Configure WordPress REST and Trash
 
-Create a dedicated, least-privilege WordPress account and Application Password. Store these values only as Vercel server-side environment variables; they must never appear in browser code, Blob reports, exports, logs, or Git.
+Create a dedicated, least-privilege WordPress account and Application Password (WordPress **Users → Profile → Application Passwords → Add New Application Password**; the password is shown once — see "Creating the WordPress Application Password" in [README.md](README.md) for the full steps and the required role). Store these values only as Vercel server-side environment variables; they must never appear in browser code, Blob reports, exports, logs, or Git.
 
 Add these variables to **Production only**:
 
@@ -62,7 +62,7 @@ Add these variables to **Production only**:
 
 `WP_REST_REMOTE_WRITE_ENABLED` is the additional production-only safety gate. The code refuses Vercel writes outside `VERCEL_ENV=production`, so Preview remains read-only even if variables are accidentally copied there. WordPress REST must use HTTPS, the uploaded export must match `WP_REST_BASE_URL`, and the browser request must be authenticated, CSRF-protected, and same-origin.
 
-First deploy with `WP_REST_WRITE_ENABLED=0`, verify live checks against a disposable record, then enable both write flags and verify one reversible Trash operation. Revoke the Application Password immediately if the Vercel project or reviewer access is compromised.
+First deploy with `WP_REST_WRITE_ENABLED=0`, verify live checks against a disposable record (open it in the review sheet, or use **Check live WordPress** on a small group and confirm the coverage strip shows checked records), then enable both write flags and verify one reversible Trash operation. Revoke the Application Password immediately if the Vercel project or reviewer access is compromised.
 
 ## 5. Protect the application
 

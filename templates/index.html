@@ -125,12 +125,14 @@
               <p id="active-group-description"></p>
             </div>
             <div class="workspace-actions">
+              {% if rest_enabled %}<button class="button button-primary" id="live-check-group" type="button">Check live WordPress</button>{% endif %}
               <a class="button button-outline" id="export-csv" href="/api/export.csv">Export CSV</a>
               <a class="button button-outline" id="export-json" href="/api/export.json">Export JSON</a>
             </div>
           </header>
 
           <div class="summary-strip" id="summary-strip" aria-label="Selected group summary"></div>
+          {% if rest_enabled %}<div class="live-coverage" id="live-coverage" role="status" hidden></div>{% endif %}
 
           <nav class="workspace-tabs" aria-label="Audit views">
             <button class="workspace-tab is-active" type="button" data-panel="content-panel">Content</button>
@@ -236,6 +238,17 @@
   </dialog>
 
       <script id="runtime-data" type="application/json">{{ {'chunk_size': chunk_size, 'storage_mode': storage_mode, 'rest_enabled': rest_enabled, 'rest_write_enabled': rest_write_enabled, 'write_csrf': write_csrf}|tojson }}</script>
-  <div class="loading" id="loading" hidden role="status"><div class="spinner" aria-hidden="true"></div><strong id="loading-label">Preparing the WordPress export</strong><span id="loading-detail">Building the inventory, taxonomies, and reference graph…</span><progress id="upload-progress" max="100" value="0"></progress></div>
+  <div class="loading" id="loading" hidden role="status" aria-live="polite">
+    <div class="spinner" aria-hidden="true"></div>
+    <strong id="loading-label">Preparing the WordPress export</strong>
+    <span id="loading-detail">Building the inventory, taxonomies, and reference graph…</span>
+    <progress id="upload-progress" max="100" value="0"></progress>
+    <ol class="loading-steps" id="loading-steps">
+      <li data-step="upload">Upload the export</li>
+      <li data-step="analyze">Analyze records and references</li>
+      <li data-step="open">Open the refreshed dashboard</li>
+    </ol>
+    <span class="loading-elapsed" id="loading-elapsed"></span>
+  </div>
 </body>
 </html>

@@ -32,6 +32,7 @@ AUDIT_TTL_SECONDS = 48 * 60 * 60
 LOGIN_WINDOW_SECONDS = 15 * 60
 MAX_LOGIN_FAILURES = 5
 TRASH_PREFLIGHT_TTL_SECONDS = 5 * 60
+LIVE_CHECK_MAX_IDS = 500
 REVIEW_DECISIONS = {"unreviewed", "keep", "verify", "approved"}
 LEGACY_REVIEW_DECISIONS = {"expected": "keep", "candidate": "verify"}
 FINDING_PRIORITY = {
@@ -605,12 +606,65 @@ def create_app() -> Flask:
         audit_store.put_chunk(pending["id"], index, payload)
         return jsonify({"received": index, "bytes": len(payload)})
 
+    def adopt_analyzed_upload(pending: dict) -> dict | None:
+        """Attach an already-analyzed upload to this session.
+
+        The analysis response can be lost (a proxy timeout on a large export)
+        after the report was stored, so completing or polling an upload first
+        checks for a finished report and adopts it instead of re-analyzing.
+        """
+        upload_id = pending["id"]
+        state = audit_store.load_report(upload_id)
+        if not state or (auth_enforced() and state.get("owner_email") != current_user_email()):
+            return None
+        previous_id = pending.get("previous_audit_id")
+        if previous_id and previous_id != upload_id:
+            audit_store.delete_audit(previous_id)
+        session["audit_id"] = upload_id
+        session.pop("pending_upload", None)
+        try:
+            audit_store.delete_chunks(upload_id, pending.get("total_chunks", 0))
+        except Exception:
+            app.logger.exception("Temporary upload chunks could not be removed")
+        return state
+
+    @app.post("/api/upload-status")
+    def api_upload_status():
+        """Report whether the pending upload has finished analysis; adopt it when it has."""
+        pending = session.get("pending_upload") or {}
+        if not pending or (auth_enforced() and pending.get("owner_email") != current_user_email()):
+            return jsonify({"pending": False, "analyzed": False})
+        state = adopt_analyzed_upload(pending)
+        if state:
+            report = state.get("report") or {}
+            return jsonify({
+                "pending": False, "analyzed": True, "redirect": "/",
+                "records": int((report.get("stats") or {}).get("reportable_items") or 0),
+                "analysis_seconds": report.get("analysis_seconds"),
+            })
+        stored = sum(
+            audit_store.get_chunk(pending["id"], index) is not None
+            for index in range(int(pending.get("total_chunks") or 0))
+        )
+        return jsonify({
+            "pending": True, "analyzed": False, "filename": pending.get("filename", ""),
+            "size": pending.get("size", 0), "total_chunks": pending.get("total_chunks", 0),
+            "stored_chunks": stored,
+        })
+
     @app.post("/api/complete-upload")
     def api_complete_upload():
         pending = session.get("pending_upload") or {}
         if not pending or (auth_enforced() and pending.get("owner_email") != current_user_email()):
             return jsonify({"error": "Upload session is missing or expired."}), 400
         upload_id = pending["id"]
+        already = adopt_analyzed_upload(pending)
+        if already:
+            report = already.get("report") or {}
+            return jsonify({
+                "ok": True, "redirect": "/", "records": int((report.get("stats") or {}).get("reportable_items") or 0),
+                "analysis_seconds": report.get("analysis_seconds"), "recovered": True,
+            })
         try:
             assembled = BytesIO()
             for index in range(pending["total_chunks"]):
@@ -685,10 +739,19 @@ def create_app() -> Flask:
             "decisions": sorted(REVIEW_DECISIONS),
             "live": ["unchecked", "found", "trashed", "missing", "not-in-rest", "error"],
         }
+        # Live states belong to this audit only: a replacement export starts
+        # with every record unchecked, so the dashboard shows the coverage.
+        live_states = [(live.get(row["id"]) or {}).get("live_state") or "unchecked" for row in all_group_rows]
+        live_summary = {
+            "total": len(all_group_rows),
+            "checked": sum(state != "unchecked" for state in live_states),
+            **{state: live_states.count(state) for state in facets["live"]},
+        }
         return jsonify(
             {
                 "items": [list_payload(row, decisions, live) for row in rows[start:start + page_size]],
                 "total": len(rows),
+                "live_summary": live_summary,
                 "page": page,
                 "page_size": page_size,
                 "page_count": max(1, (len(rows) + page_size - 1) // page_size),
@@ -765,6 +828,8 @@ def create_app() -> Flask:
             parsed_ids = [wordpress_id(value) for value in raw_ids]
             if any(item_id is None for item_id in parsed_ids):
                 return jsonify({"error": "Each live-check ID must be a positive WordPress ID."}), 400
+            if len(parsed_ids) > LIVE_CHECK_MAX_IDS:
+                return jsonify({"error": f"Check at most {LIVE_CHECK_MAX_IDS} records per request."}), 400
             wanted = set(parsed_ids)
         else:
             wanted = set()

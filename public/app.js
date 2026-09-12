@@ -109,8 +109,49 @@
 
   async function responseJson(response) {
     const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.error || `The server returned HTTP ${response.status}.`);
+    if (!response.ok) {
+      const error = new Error(payload.error || `The server returned HTTP ${response.status}.`);
+      error.status = response.status;
+      throw error;
+    }
     return payload;
+  }
+
+  const uploadUi = {
+    steps: (name) => qsa("#loading-steps li").forEach((item) => {
+      const order = ["upload", "analyze", "open"], mine = order.indexOf(item.dataset.step), current = order.indexOf(name);
+      item.classList.toggle("is-done", mine < current); item.classList.toggle("is-active", mine === current);
+    }),
+    timer: null,
+    startClock(started) {
+      const node = qs("#loading-elapsed"); clearInterval(this.timer);
+      this.timer = setInterval(() => {
+        const seconds = Math.round((Date.now() - started) / 1000);
+        let note = "";
+        if (seconds >= 150) note = " · Large exports can take several minutes; stay on this page.";
+        else if (seconds >= 45) note = " · Still working. Large exports take a while to analyze.";
+        node.textContent = `${seconds}s elapsed${note}`;
+      }, 1000);
+    },
+    stopClock() { clearInterval(this.timer); this.timer = null; },
+  };
+
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  async function recoverAnalysis(detail, deadlineMs) {
+    // The analysis response can be lost after the report was stored
+    // (a proxy timeout on a large export). Poll until it shows up.
+    const started = Date.now();
+    while (Date.now() - started < deadlineMs) {
+      detail.textContent = "The analysis response was interrupted. Checking whether the export finished analyzing…";
+      await wait(5000);
+      try {
+        const status = await responseJson(await fetch("/api/upload-status", { method: "POST", headers: csrfHeaders() }));
+        if (status.analyzed) return status;
+        if (!status.pending) return null;
+      } catch (error) { /* keep polling until the deadline */ }
+    }
+    return null;
   }
 
   async function uploadInChunks(form) {
@@ -118,7 +159,11 @@
     if (!file) return;
     const loading = qs("#loading"), progress = qs("#upload-progress");
     const label = qs("#loading-label"), detail = qs("#loading-detail");
+    const started = Date.now();
+    const megabytes = (file.size / (1024 * 1024)).toFixed(1);
+    loading.querySelector(".button")?.remove();
     loading.hidden = false; progress.value = 0; label.textContent = "Uploading the WordPress export";
+    uploadUi.steps("upload"); uploadUi.startClock(started);
     try {
       const totalChunks = Math.ceil(file.size / chunkSize);
       await responseJson(await fetch("/api/upload-session", {
@@ -127,20 +172,33 @@
       }));
       for (let index = 0; index < totalChunks; index += 1) {
         const start = index * chunkSize, end = Math.min(start + chunkSize, file.size);
-        detail.textContent = `Securely uploading part ${index + 1} of ${totalChunks}…`;
+        const sent = (end / (1024 * 1024)).toFixed(1);
+        detail.textContent = `Securely uploading part ${index + 1} of ${totalChunks} (${sent} of ${megabytes} MB)…`;
         await responseJson(await fetch(`/api/upload-chunk/${index}`, {
           method: "POST", headers: csrfHeaders({ "Content-Type": "application/octet-stream" }), body: file.slice(start, end),
         }));
-        progress.value = Math.round(((index + 1) / totalChunks) * 75);
+        progress.value = Math.round(((index + 1) / totalChunks) * 60);
       }
       label.textContent = "Analyzing the WordPress export";
-      detail.textContent = "Building the inventory, taxonomies, and reference graph…";
-      progress.value = 82;
-      const completed = await responseJson(await fetch("/api/complete-upload", { method: "POST", headers: csrfHeaders() }));
-      progress.value = 100;
-      detail.textContent = `${completed.records.toLocaleString()} records analyzed. Opening the dashboard…`;
+      detail.textContent = `Upload complete (${megabytes} MB). Building the inventory, taxonomies, and reference graph — this is one long step with no partial progress.`;
+      progress.removeAttribute("value"); uploadUi.steps("analyze");
+      let completed;
+      try {
+        completed = await responseJson(await fetch("/api/complete-upload", { method: "POST", headers: csrfHeaders() }));
+      } catch (error) {
+        // A 4xx is a definite server verdict; a network failure or gateway
+        // timeout may mean the report was stored but the response was lost.
+        if (error.status && error.status < 500) throw error;
+        completed = await recoverAnalysis(detail, 4 * 60 * 1000);
+        if (!completed) throw new Error(`${error.message} The export did not finish analyzing. Choose the file again to retry.`);
+      }
+      progress.value = 100; uploadUi.steps("open"); uploadUi.stopClock();
+      const seconds = completed.analysis_seconds ? ` in ${completed.analysis_seconds}s` : "";
+      label.textContent = "Export analyzed";
+      detail.textContent = `${Number(completed.records || 0).toLocaleString()} records analyzed${seconds}. Live WordPress states start as “Not checked” for a new export. Opening the dashboard…`;
       window.location.assign(completed.redirect || "/");
     } catch (error) {
+      uploadUi.stopClock();
       loading.hidden = true;
       uploadError(form, error.message || "The export could not be uploaded.");
     }
@@ -422,12 +480,66 @@
         qs("#result-count").after(el("p", "trash-hint", "Checkboxes unlock after the live WordPress check passes and you choose Approve to delete in the review card."));
       }
       if (state.queue) qs("#summary-strip").replaceChildren(summaryItem("In queue", payload.total, "Needs attention"));
+      renderLiveCoverage(payload.live_summary);
       qs("#page-status").textContent = `Page ${payload.page.toLocaleString()} of ${payload.page_count.toLocaleString()}`;
       qs("#previous-page").disabled = payload.page <= 1; qs("#next-page").disabled = payload.page >= payload.page_count; qs("#empty-state").hidden = payload.total !== 0;
       const exportParams = queryParams(false); qs("#export-csv").href = `/api/export.csv?${exportParams}`; qs("#export-json").href = `/api/export.json?${exportParams}`;
     } catch (error) { qs("#result-count").textContent = error.message; qs("#empty-state").hidden = false; }
     finally { qs("#results-body").classList.remove("is-loading"); }
   }
+  const liveRun = { active: false };
+  function renderLiveCoverage(summary) {
+    const node = qs("#live-coverage"), button = qs("#live-check-group");
+    if (!node || !summary) return;
+    const { total = 0, checked = 0, trashed = 0, missing = 0, error = 0 } = summary;
+    const scope = state.queue ? "the work queue" : `the ${activeGroup().label || "selected"} group`;
+    node.hidden = false; node.classList.toggle("is-warning", total > 0 && checked === 0);
+    node.replaceChildren();
+    if (!total) { node.append(el("span", "", "No records to check live.")); if (button) button.disabled = true; return; }
+    if (button) { button.disabled = liveRun.active; button.textContent = liveRun.active ? "Checking live WordPress…" : (checked ? "Re-check live WordPress" : "Check live WordPress"); }
+    const bar = document.createElement("progress"); bar.max = total; bar.value = checked;
+    const summaryText = el("span", "");
+    summaryText.append(el("strong", "", `${checked.toLocaleString()} of ${total.toLocaleString()}`), ` records in ${scope} checked against live WordPress`);
+    node.append(bar, summaryText);
+    if (checked) node.append(el("span", "", `${trashed.toLocaleString()} in Trash · ${missing.toLocaleString()} missing · ${error.toLocaleString()} errors`));
+    else node.append(el("span", "", "Live states reset whenever a new export is analyzed. Run the check to populate the “Live WordPress” filter, including “In trash”."));
+  }
+
+  async function liveCheckGroup() {
+    const button = qs("#live-check-group"), node = qs("#live-coverage");
+    if (!button || liveRun.active) return;
+    liveRun.active = true; button.disabled = true; button.textContent = "Checking live WordPress…";
+    const scopeParams = new URLSearchParams(state.queue ? { queue: "1" } : { group: state.group });
+    const errors = [];
+    let checked = 0, total = 0;
+    try {
+      const ids = (await responseJson(await fetch(`/api/items/ids?${scopeParams}`))).ids.map(String);
+      total = ids.length;
+      const batch = 100;
+      for (let start = 0; start < ids.length; start += batch) {
+        const chunk = ids.slice(start, start + batch);
+        node.replaceChildren(el("span", "", `Checking live WordPress: ${checked.toLocaleString()} of ${total.toLocaleString()} records…`));
+        try {
+          const result = await responseJson(await fetch("/api/live-check", {
+            method: "POST", headers: csrfHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ ids: chunk }),
+          }));
+          checked += result.checked || chunk.length;
+        } catch (error) {
+          errors.push(error.message);
+          if (error.status === 403 || error.status === 409) break;
+        }
+      }
+    } catch (error) { errors.push(error.message); }
+    liveRun.active = false;
+    await loadItems(true);
+    await loadQueueCount();
+    if (errors.length) {
+      const alert = el("p", "review-live-note", `Live check stopped after ${checked.toLocaleString()} of ${total.toLocaleString()} records: ${errors[0]}`);
+      qs("#live-coverage")?.append(alert);
+    }
+  }
+  qs("#live-check-group")?.addEventListener("click", liveCheckGroup);
+
   function detailField(list, name, value) { const field = el("div", "detail-field"); field.append(el("dt", "", name), el("dd", "", value || "—")); list.append(field); }
   function reviewContext(item) {
     return [
