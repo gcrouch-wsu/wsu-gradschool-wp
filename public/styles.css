@@ -39,6 +39,7 @@ h3 { font-size: 1.1rem; }
 .file-drop:hover, .file-drop.is-dragging { background: #fff6f8; border-color: var(--crimson); }
 .file-drop input { clip: rect(0, 0, 0, 0); height: 1px; position: absolute; width: 1px; }
 .file-drop strong, .file-drop small { display: block; }
+.file-drop.is-waiting { background: #fff6f8; border-color: var(--crimson); border-style: solid; }.file-drop.is-waiting .file-icon { animation: pulse 1s ease-in-out infinite; }.file-drop.is-ready { background: #f2f8f3; border-color: #2f6f3e; border-style: solid; }.file-drop.is-ready .file-icon { background: #2f6f3e; color: white; }@keyframes pulse { 50% { opacity: .35; } }
 .file-drop small { color: var(--muted); margin-top: 3px; }
 .file-icon { align-items: center; background: #f4e0e5; border-radius: 6px; color: var(--crimson); display: flex; flex: 0 0 46px; font-size: .72rem; font-weight: 900; height: 52px; justify-content: center; letter-spacing: .06em; }
 .button { align-items: center; border: 1px solid transparent; border-radius: 6px; cursor: pointer; display: inline-flex; font-weight: 700; justify-content: center; padding: 10px 15px; text-decoration: none; transition: .15s ease; }

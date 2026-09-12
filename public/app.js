@@ -76,8 +76,46 @@
   function wireUpload(inputSelector, labelSelector) {
     const input = qs(inputSelector), label = qs(labelSelector), drop = input?.closest(".file-drop");
     if (!input || !label || !drop) return;
-    const show = (file) => { if (file) label.textContent = `${file.name} · ${formatBytes(file.size)}`; };
-    input.addEventListener("change", () => show(input.files[0]));
+    const form = input.closest("form"), submit = form?.querySelector('button[type="submit"]');
+    const hint = drop.querySelector("small"), idleLabel = label.textContent, idleHint = hint?.textContent || "";
+    const submitLabel = submit?.innerHTML || "";
+    let waitTimer = null, waitStarted = 0;
+    const setSubmit = (ready, text) => {
+      if (!submit) return;
+      submit.disabled = !ready;
+      if (text) submit.textContent = text; else submit.innerHTML = submitLabel;
+    };
+    const stopWaiting = () => { clearInterval(waitTimer); waitTimer = null; drop.classList.remove("is-waiting"); };
+    const reset = () => {
+      stopWaiting(); label.textContent = idleLabel; if (hint) hint.textContent = idleHint; setSubmit(true);
+    };
+    const show = (file) => {
+      if (!file) return;
+      stopWaiting();
+      drop.classList.add("is-ready");
+      label.textContent = `${file.name} · ${formatBytes(file.size)}`;
+      if (hint) hint.textContent = `Attached and ready. Choose ${submit ? submit.textContent.trim().replace(/\s*→$/, "") : "Analyze"} to upload and analyze it.`;
+      setSubmit(true);
+    };
+    // Choosing a large export (or one that OneDrive/a network drive must
+    // download first) can take a minute before the browser hands it over.
+    // Show that wait instead of leaving the page looking idle.
+    const startWaiting = () => {
+      drop.classList.remove("is-ready"); drop.classList.add("is-waiting");
+      waitStarted = Date.now();
+      label.textContent = "Waiting for the selected file…";
+      if (hint) hint.textContent = "Large exports, and files stored in OneDrive or on a network drive, can take a minute to attach.";
+      setSubmit(false, "Waiting for file…");
+      clearInterval(waitTimer);
+      waitTimer = setInterval(() => {
+        const seconds = Math.round((Date.now() - waitStarted) / 1000);
+        label.textContent = `Waiting for the selected file… ${seconds}s`;
+        if (seconds >= 20 && hint) hint.textContent = "Still reading the file. If you closed the picker without choosing a file, click here to choose again.";
+      }, 1000);
+    };
+    input.addEventListener("click", startWaiting);
+    input.addEventListener("change", () => (input.files[0] ? show(input.files[0]) : reset()));
+    input.addEventListener("cancel", reset);
     ["dragenter", "dragover"].forEach((name) => drop.addEventListener(name, (event) => {
       event.preventDefault(); drop.classList.add("is-dragging");
     }));
