@@ -23,6 +23,14 @@ python app.py
 
 Open <http://127.0.0.1:5000>, select **Tools → Export → All content** from WordPress, and upload the resulting XML file.
 
+## One-time local media archive
+
+Before beginning a cleanup project, run `python launch_archive_app.py` and open <http://127.0.0.1:5055>. Choose the same fresh WXR export and an absolute local or WSU-approved shared-drive destination. The companion inventories attachment files and `document` custom-post records, shows every source host for explicit approval, and then streams files into a resumable archive with SHA-256 checksums. Run the bounded representative test before the complete archive; it covers every media/document file-type and source-host combination, every asset role, every record status (draft, pending, and private files included), and every unverified document link without changing full-archive progress, and it lists each sample that did not download with its host, URL, HTTP result, and reason. No WordPress sign-in is needed for public or unpublished files: WP Document Revisions permalinks are replaced by the stored upload on the WSU CDN, which serves files regardless of post status. Application Password credentials are only for retrying an actual 401/403 from the WordPress host and remain in memory for that run.
+
+See [ARCHIVING.md](ARCHIVING.md) for the archive contents, completion rules, recovery workflow, and known boundaries.
+
+An archive is marked **Completed** only when every planned file is present and verified and every attachment or `document` record resolves to at least one file. Failed downloads, unapproved hosts, attachment records without URLs, and custom document records whose file relationship is absent from the WXR keep the archive **Incomplete**. Generated thumbnails are not downloaded; current attachment originals and exported WordPress pre-edit originals are included.
+
 In local mode, the latest report and review decisions remain in memory until the process stops or another export is analyzed. On Vercel, private Blob storage keeps each signed-in reviewer's current audit available across function invocations. Reports are owner-bound and expire after 48 hours when next accessed. Temporary raw XML chunks are deleted after analysis, and abandoned Blob chunks expire after one hour when a later upload refreshes the chunk index.
 
 The dashboard groups records into Posts, Pages, Events, Media, Documents, Forms, TablePress, Factsheets, and Other. Filters, taxonomy drill-downs, evidence details, review decisions, and CSV/JSON exports operate on the stored report for the current session. Published Events and graduate factsheets are marked needs-verification from an assumed public archive; the export cannot prove those archives are enabled or complete. Exported menus are used as entry points only when their status is publish, and even then the export cannot prove a live theme location.

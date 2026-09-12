@@ -4,7 +4,7 @@
   "functions": {
     "app.py": {
       "maxDuration": 300,
-      "excludeFiles": "{tests/**,__pycache__/**,**/*.pyc,*.xml,legacy_wp.py,static/**}"
+      "excludeFiles": "{tests/**,__pycache__/**,**/*.pyc,*.xml,archive_app.py,archive_tool.py,launch_archive_app.py,.archive-data/**,public/archive.css,templates/archive.html,static/**}"
     }
   }
 }

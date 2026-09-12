@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  {% if job and (job.status == "running" or job.test_status == "running") %}<meta http-equiv="refresh" content="3">{% endif %}
+  <title>WordPress Media Archive</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='archive.css') }}">
+</head>
+<body>
+  <header class="site-header">
+    <div>
+      <p class="eyebrow">WSU Graduate School</p>
+      <h1>WordPress Media Archive</h1>
+      <p>Make one verified local or shared-drive copy of media and document files before cleanup begins.</p>
+    </div>
+    <span class="local-badge">Local computer only</span>
+  </header>
+
+  <main>
+    {% if error %}<div class="alert alert-error"><strong>Could not continue</strong><span>{{ error }}</span></div>{% endif %}
+
+    <section class="card">
+      <h2>1. Inspect a fresh WordPress export</h2>
+      <p>The export is parsed locally and removed from the temporary upload folder after the archive plan is created. Files are not downloaded until you review their source hosts.</p>
+      <form method="post" action="{{ url_for('inspect_export') }}" enctype="multipart/form-data" class="stack">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <label>
+          <span>WordPress WXR export</span>
+          <input type="file" name="wxr_file" accept=".xml,text/xml,application/xml" required>
+        </label>
+        <label>
+          <span>Archive destination</span>
+          <input type="text" name="output_root" value="{{ output_root }}" required>
+          <small>Use an absolute folder path. A WSU-approved shared or network drive is recommended.</small>
+        </label>
+        <button type="submit">Inspect export and create archive plan</button>
+      </form>
+    </section>
+
+    {% if job and manifest %}
+      {% set summary = manifest.summary %}
+      {% set plan_outdated = manifest.schema_version != archive_schema_version %}
+      {% set test_running = job.test_status == 'running' %}
+      <section class="card status-card status-{{ job.status }}">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">{{ manifest.site.title or 'WordPress site' }}</p>
+            <h2>2. Review and run the archive</h2>
+          </div>
+          <span class="status-pill">{% if test_running %}Test Running{% else %}{{ job.status|replace('_', ' ')|title }}{% endif %}</span>
+        </div>
+        <p>{% if test_running %}{{ job.test_message }}{% else %}{{ job.message }}{% endif %}</p>
+        {% if plan_outdated %}<div class="alert alert-error"><strong>Fresh inspection required</strong><span>This saved plan uses an older document extractor. Select the original WXR export above to create a corrected plan before starting the archive.</span></div>{% endif %}
+        <dl class="summary-grid">
+          <div><dt>Attachments</dt><dd>{{ summary.attachment_records }}</dd></div>
+          <div><dt>Document records</dt><dd>{{ summary.document_records }}</dd></div>
+          <div><dt>Document links to verify</dt><dd>{{ summary.document_links_to_verify or 0 }}</dd></div>
+          <div><dt>Stored upload URLs</dt><dd>{{ summary.stored_upload_urls or 0 }}</dd></div>
+          <div><dt>Files planned</dt><dd>{{ summary.assets }}</dd></div>
+          <div><dt>Unresolved records</dt><dd>{{ summary.unresolved_records }}</dd></div>
+          <div><dt>Downloaded</dt><dd>{{ summary.completed_assets }}</dd></div>
+          <div><dt>Failed or blocked</dt><dd>{{ summary.failed_assets + summary.blocked_assets }}</dd></div>
+        </dl>
+        {% if summary.document_links_to_verify %}<p class="warning">These document records had no exported attachment. Their WSU document URLs will count only if the download returns a real non-HTML file.</p>{% endif %}
+        {% if summary.stored_upload_urls %}<p class="note">{{ summary.stored_upload_urls }} attachment records (WP Document Revisions files) export a <code>-revision-N</code> permalink that the WordPress host serves only to signed-in users. The plan downloads their stored upload from <code>{{ summary.uploads_base_url }}</code> instead and keeps the permalink as an authenticated fallback.</p>{% endif %}
+        <p><strong>Archive folder:</strong> <code>{{ job.output_dir }}</code></p>
+        <p><strong>Source export:</strong> {{ manifest.source_export.filename }} · SHA-256 {{ manifest.source_export.sha256 }}</p>
+
+        {% if job.status == 'running' %}
+          <progress value="{{ job.completed }}" max="{{ job.total or 1 }}"></progress>
+          <p>{{ job.completed }} of {{ job.total }} files processed. This page refreshes automatically.</p>
+        {% elif test_running %}
+          <progress value="{{ job.test_completed }}" max="{{ job.test_total or 1 }}"></progress>
+          <p>{{ job.test_completed }} of {{ job.test_total }} representative files tested. This page refreshes automatically.</p>
+        {% else %}
+          <form method="post" action="{{ url_for('start_archive', job_id=job.id) }}" class="stack archive-start">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <fieldset>
+              <legend>Approve source hosts</legend>
+              <p>Only checked hosts can receive download requests. The WordPress host and hosts under the same institutional domain (such as the WSU CDN that stores uploads) are pre-checked; review any other external host before approving it. Unchecked hosts make their files <em>blocked</em> in the test and the archive.</p>
+              {% for host in manifest.source_hosts %}
+                <label class="check-row">
+                  <input type="checkbox" name="approved_host" value="{{ host }}" {% if host in preferred_hosts or host in manifest.approved_hosts or host in (job.approved_hosts or []) %}checked{% endif %}>
+                  <span>{{ host }}</span>
+                </label>
+              {% else %}
+                <p class="warning">No downloadable file URLs were found.</p>
+              {% endfor %}
+            </fieldset>
+            <details>
+              <summary>Credentials for retrying 401/403 download failures (usually unnecessary)</summary>
+              <div class="credential-grid">
+                <label><span>WordPress username</span><input name="wp_username" autocomplete="off"></label>
+                <label><span>Application Password</span><input type="password" name="wp_application_password" autocomplete="new-password"></label>
+              </div>
+              <p class="warning">These values only authenticate downloads whose URL is already in the archive plan. They do not resolve missing document records. Leave them blank unless a download from the WordPress host fails with 401 or 403. Values stay in memory and are never written to the manifest. Do not use a WSU Network ID password.</p>
+            </details>
+            <div class="button-row">
+              <button type="submit" class="button-secondary" formaction="{{ url_for('test_archive', job_id=job.id) }}" {% if not manifest.source_hosts or plan_outdated or not test_sample_count %}disabled{% endif %}>
+                Test representative sample ({{ test_sample_count }} file{% if test_sample_count != 1 %}s{% endif %})
+              </button>
+              <button type="submit" {% if not manifest.source_hosts or plan_outdated %}disabled{% endif %}>
+                {% if plan_outdated %}Inspect export again to continue{% elif job.status in ['incomplete', 'error'] %}Retry complete archive{% else %}Start complete archive{% endif %}
+              </button>
+            </div>
+            {% if test_sample_summary %}<p class="sample-coverage"><strong>Test coverage:</strong> media-owned samples {{ test_sample_summary.media }}; document-owned samples {{ test_sample_summary.document }}; types {{ test_sample_summary.file_types|join(', ') }}; hosts {{ test_sample_summary.source_hosts|join(', ') }}; record statuses {{ test_sample_summary.record_statuses|join(', ') }}.</p>{% endif %}
+            <small>The test covers every media/document file type on each source host, every special asset role, every record status (draft, pending, and private files are archived from the stored upload without signing in), and every unverified document link. It writes only to <code>test-downloads</code> and does not change full-archive progress.</small>
+          </form>
+        {% endif %}
+
+        {% if job.test_status and not test_running %}
+          <div class="test-result test-result-{{ job.test_status }}">
+            <h3>Representative test: {{ job.test_status|replace('_', ' ')|title }}</h3>
+            <p>{{ job.test_message }}</p>
+            {% if test_result %}
+              {% if test_result.error %}<p class="warning"><strong>Stopped by:</strong> {{ test_result.error }}</p>{% endif %}
+              <dl class="summary-grid compact-summary">
+                <div><dt>Selected</dt><dd>{{ test_result.summary.selected_assets }}</dd></div>
+                <div><dt>Downloaded</dt><dd>{{ test_result.summary.completed_assets }}</dd></div>
+                <div><dt>Failed</dt><dd>{{ test_result.summary.failed_assets }}</dd></div>
+                <div><dt>Blocked</dt><dd>{{ test_result.summary.blocked_assets }}</dd></div>
+                {% if test_result.summary.not_tested_assets %}<div><dt>Not tested</dt><dd>{{ test_result.summary.not_tested_assets }}</dd></div>{% endif %}
+              </dl>
+              <p><strong>Test run:</strong> {{ test_result.run_id }} · <strong>approved hosts:</strong> {{ test_result.approved_hosts|join(', ') }} · <strong>file types:</strong> {{ test_result.summary.file_types|join(', ') }}</p>
+              {% if test_result.download_root %}<p><strong>Downloaded samples:</strong> <code>{{ test_result.download_root }}</code></p>{% endif %}
+              {% if test_result.unapproved_sample_hosts %}
+                <div class="alert alert-error"><strong>Host not approved</strong><span>{{ test_result.unapproved_sample_hosts|join(', ') }} was not checked for this test, so its samples were blocked before any request was sent. Check the host under “Approve source hosts” and run the test again.</span></div>
+              {% endif %}
+              {% set failed_samples = test_result.assets|rejectattr('status', 'equalto', 'completed')|list %}
+              {% if failed_samples %}
+                <h4>Samples that did not download</h4>
+                <div class="table-wrap">
+                  <table class="sample-table">
+                    <thead><tr><th>Status</th><th>Category</th><th>Type</th><th>Host</th><th>URL</th><th>HTTP / network result</th><th>Reason</th></tr></thead>
+                    <tbody>
+                      {% for asset in failed_samples %}
+                        <tr>
+                          <td><span class="sample-status sample-status-{{ asset.status }}">{{ asset.status }}</span></td>
+                          <td>{{ asset.category }}{% if asset.record_statuses %}<br><small>{{ asset.record_statuses|join(', ') }}</small>{% endif %}</td>
+                          <td>{{ asset.file_type }}</td>
+                          <td>{{ asset.source_host }}</td>
+                          <td><code>{{ asset.url }}</code>{% if asset.fallback_urls %}<br><small>fallback: <code>{{ asset.fallback_urls|join(', ') }}</code></small>{% endif %}</td>
+                          <td>{{ asset.result or '—' }}</td>
+                          <td>{{ asset.error }}</td>
+                        </tr>
+                      {% endfor %}
+                    </tbody>
+                  </table>
+                </div>
+              {% endif %}
+              {% set passed_samples = test_result.assets|selectattr('status', 'equalto', 'completed')|list %}
+              {% if passed_samples %}
+                <details>
+                  <summary>Downloaded samples ({{ passed_samples|length }})</summary>
+                  <div class="table-wrap">
+                    <table class="sample-table">
+                      <thead><tr><th>Category</th><th>Type</th><th>Host</th><th>Bytes</th><th>Content type</th><th>Saved as</th></tr></thead>
+                      <tbody>
+                        {% for asset in passed_samples %}
+                          <tr><td>{{ asset.category }}{% if asset.record_statuses %} <small>({{ asset.record_statuses|join(', ') }})</small>{% endif %}</td><td>{{ asset.file_type }}</td><td>{{ asset.source_host }}</td><td>{{ asset.bytes }}</td><td>{{ asset.content_type }}</td><td><code>{{ asset.relative_path }}</code></td></tr>
+                        {% endfor %}
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+              {% endif %}
+            {% else %}
+              <p class="warning">No test-results.json was found for this plan. Run the representative test again.</p>
+            {% endif %}
+          </div>
+        {% endif %}
+
+        <form method="post" action="{{ url_for('open_archive_folder', job_id=job.id) }}" class="inline-form">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <button type="submit" class="button-secondary">Open archive folder</button>
+        </form>
+      </section>
+
+      {% set unresolved = manifest.records|selectattr('asset_ids', 'equalto', [])|list %}
+      {% if unresolved %}
+        <section class="card">
+          <h2>Unresolved records</h2>
+          <p>These records prevent a “Completed” result. A custom <code>document</code> record is not considered archived merely because its public landing page exists.</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>WordPress ID</th><th>Type</th><th>Title</th><th>Reason</th></tr></thead>
+              <tbody>
+                {% for record in unresolved[:100] %}
+                  <tr><td>{{ record.wordpress_id }}</td><td>{{ record.post_type }}</td><td>{{ record.title }}</td><td>{{ record.error }}</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          {% if unresolved|length > 100 %}<p>{{ unresolved|length - 100 }} more unresolved records are listed in <code>manifest.json</code>.</p>{% endif %}
+        </section>
+      {% endif %}
+
+      {% set problem_assets = manifest.assets|rejectattr('status', 'in', ['pending', 'downloading', 'completed'])|list %}
+      {% if problem_assets %}
+        <section class="card">
+          <h2>Failed or blocked files</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Status</th><th>File</th><th>Source</th><th>Reason</th></tr></thead>
+              <tbody>
+                {% for asset in problem_assets[:100] %}
+                  <tr><td>{{ asset.status }}</td><td>{{ asset.relative_path }}</td><td>{{ asset.source_host }}</td><td>{{ asset.error }}</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      {% endif %}
+    {% endif %}
+
+    {% if recent %}
+      <section class="card">
+        <h2>Recent archive plans</h2>
+        <ul class="recent-list">
+          {% for row in recent %}
+            <li><a href="{{ url_for('index', job=row.id) }}">{{ row.created_at }} · {{ row.status }} · {{ row.output_dir }}</a></li>
+          {% endfor %}
+        </ul>
+      </section>
+    {% endif %}
+  </main>
+</body>
+</html>

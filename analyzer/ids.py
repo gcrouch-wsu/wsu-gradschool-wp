@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from ipaddress import ip_address
 from urllib.parse import urlsplit
 
 
@@ -72,4 +73,14 @@ def sites_are_same(export_urls: list[str], rest_url: str) -> bool:
 
 
 def is_loopback_address(value: str) -> bool:
-    return (value or "").casefold().strip("[]") in LOOPBACK_HOSTS
+    candidate = (value or "").strip().strip("[]").split("%", 1)[0]
+    if candidate.casefold() == "localhost":
+        return True
+    try:
+        address = ip_address(candidate)
+    except ValueError:
+        return False
+    if address.is_loopback:
+        return True
+    mapped = getattr(address, "ipv4_mapped", None)
+    return bool(mapped and mapped.is_loopback)

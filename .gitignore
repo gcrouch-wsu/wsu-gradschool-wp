@@ -3,6 +3,8 @@
 !tests/fixtures/*.xml
 exports/
 reports/
+.archive-data/
+wordpress-archives/
 
 # Python
 __pycache__/
