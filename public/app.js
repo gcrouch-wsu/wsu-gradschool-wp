@@ -526,27 +526,58 @@
     finally { qs("#results-body").classList.remove("is-loading"); }
   }
   const liveRun = { active: false };
+  function scopeLabel() {
+    return state.queue ? "the work queue" : `the ${activeGroup().label || "selected"} group`;
+  }
+  function setCoverage({ mode, step, title, detail, button, disabled = false, progress = null, note = "" }) {
+    const node = qs("#live-coverage");
+    if (!node) return;
+    node.hidden = false;
+    node.classList.toggle("is-required", mode === "required");
+    node.classList.toggle("is-running", mode === "running");
+    node.classList.toggle("is-done", mode === "done");
+    qs("#live-coverage-step").textContent = step;
+    qs("#live-coverage-title").textContent = title;
+    qs("#live-coverage-detail").textContent = detail;
+    const bar = qs("#live-coverage-progress");
+    if (progress) { bar.hidden = false; bar.max = progress.total || 1; bar.value = progress.value; } else bar.hidden = true;
+    const action = qs("#live-check-group");
+    if (action) { action.textContent = button; action.disabled = disabled; }
+    node.querySelector(".review-live-note")?.remove();
+    if (note) qs(".live-coverage-text").append(el("p", "review-live-note", note));
+  }
   function renderLiveCoverage(summary) {
-    const node = qs("#live-coverage"), button = qs("#live-check-group");
-    if (!node || !summary) return;
+    if (!qs("#live-coverage") || !summary || liveRun.active) return;
     const { total = 0, checked = 0, trashed = 0, missing = 0, error = 0 } = summary;
-    const scope = state.queue ? "the work queue" : `the ${activeGroup().label || "selected"} group`;
-    node.hidden = false; node.classList.toggle("is-warning", total > 0 && checked === 0);
-    node.replaceChildren();
-    if (!total) { node.append(el("span", "", "No records to check live.")); if (button) button.disabled = true; return; }
-    if (button) { button.disabled = liveRun.active; button.textContent = liveRun.active ? "Checking live WordPress…" : (checked ? "Re-check live WordPress" : "Check live WordPress"); }
-    const bar = document.createElement("progress"); bar.max = total; bar.value = checked;
-    const summaryText = el("span", "");
-    summaryText.append(el("strong", "", `${checked.toLocaleString()} of ${total.toLocaleString()}`), ` records in ${scope} checked against live WordPress`);
-    node.append(bar, summaryText);
-    if (checked) node.append(el("span", "", `${trashed.toLocaleString()} in Trash · ${missing.toLocaleString()} missing · ${error.toLocaleString()} errors`));
-    else node.append(el("span", "", "Live states reset whenever a new export is analyzed. Run the check to populate the “Live WordPress” filter, including “In trash”."));
+    const scope = scopeLabel();
+    if (!total) {
+      setCoverage({ mode: "done", step: "Live WordPress", title: "Nothing to check", detail: `There are no records in ${scope}.`, button: "Check live WordPress", disabled: true });
+      return;
+    }
+    if (!checked) {
+      setCoverage({
+        mode: "required", step: "Next step — required before filtering or Trash",
+        title: `Click “Check live WordPress” to compare ${scope} with the live site`,
+        detail: `None of the ${total.toLocaleString()} records in ${scope} have been checked against live WordPress yet. Live states reset every time a new export is analyzed. Until you run this check, the “Live WordPress” filter (including “In trash”) shows nothing and no record can be moved to Trash.`,
+        button: `Check live WordPress (${total.toLocaleString()} records)`,
+      });
+      return;
+    }
+    const partial = checked < total;
+    setCoverage({
+      mode: partial ? "required" : "done",
+      step: partial ? "Next step — finish the live check" : "Live WordPress check complete",
+      title: `${checked.toLocaleString()} of ${total.toLocaleString()} records in ${scope} checked`,
+      detail: `${trashed.toLocaleString()} in Trash · ${missing.toLocaleString()} missing on the live site · ${error.toLocaleString()} check errors. ${partial ? "Click the button to check the remaining records." : "Use the “Live WordPress” filter to list records in Trash or missing. Re-check any time the site changes."}`,
+      button: partial ? `Check remaining ${(total - checked).toLocaleString()} records` : "Re-check live WordPress",
+      progress: { total, value: checked },
+    });
   }
 
   async function liveCheckGroup() {
-    const button = qs("#live-check-group"), node = qs("#live-coverage");
-    if (!button || liveRun.active) return;
-    liveRun.active = true; button.disabled = true; button.textContent = "Checking live WordPress…";
+    if (!qs("#live-check-group") || liveRun.active) return;
+    liveRun.active = true;
+    const scope = scopeLabel();
     const scopeParams = new URLSearchParams(state.queue ? { queue: "1" } : { group: state.group });
     const errors = [];
     let checked = 0, total = 0;
@@ -556,7 +587,11 @@
       const batch = 100;
       for (let start = 0; start < ids.length; start += batch) {
         const chunk = ids.slice(start, start + batch);
-        node.replaceChildren(el("span", "", `Checking live WordPress: ${checked.toLocaleString()} of ${total.toLocaleString()} records…`));
+        setCoverage({
+          mode: "running", step: "Checking live WordPress", title: `Checking ${scope}…`,
+          detail: `${checked.toLocaleString()} of ${total.toLocaleString()} records checked. Each batch of ${batch} is read from WordPress REST; nothing is changed on the site.`,
+          button: "Checking…", disabled: true, progress: { total, value: checked },
+        });
         try {
           const result = await responseJson(await fetch("/api/live-check", {
             method: "POST", headers: csrfHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ ids: chunk }),
@@ -572,8 +607,9 @@
     await loadItems(true);
     await loadQueueCount();
     if (errors.length) {
-      const alert = el("p", "review-live-note", `Live check stopped after ${checked.toLocaleString()} of ${total.toLocaleString()} records: ${errors[0]}`);
-      qs("#live-coverage")?.append(alert);
+      const node = qs("#live-coverage");
+      node?.classList.add("is-required");
+      qs(".live-coverage-text")?.append(el("p", "review-live-note", `The check stopped after ${checked.toLocaleString()} of ${total.toLocaleString()} records: ${errors[0]}`));
     }
   }
   qs("#live-check-group")?.addEventListener("click", liveCheckGroup);

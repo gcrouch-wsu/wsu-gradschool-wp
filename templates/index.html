@@ -125,14 +125,24 @@
               <p id="active-group-description"></p>
             </div>
             <div class="workspace-actions">
-              {% if rest_enabled %}<button class="button button-primary" id="live-check-group" type="button">Check live WordPress</button>{% endif %}
               <a class="button button-outline" id="export-csv" href="/api/export.csv">Export CSV</a>
               <a class="button button-outline" id="export-json" href="/api/export.json">Export JSON</a>
             </div>
           </header>
 
+          {% if rest_enabled %}
+            <section class="live-coverage" id="live-coverage" role="status" aria-labelledby="live-coverage-title" hidden>
+              <div class="live-coverage-text">
+                <p class="step" id="live-coverage-step">Next step</p>
+                <h3 id="live-coverage-title">Check live WordPress</h3>
+                <p id="live-coverage-detail"></p>
+                <progress id="live-coverage-progress" hidden></progress>
+              </div>
+              <button class="button button-primary" id="live-check-group" type="button">Check live WordPress</button>
+            </section>
+          {% endif %}
+
           <div class="summary-strip" id="summary-strip" aria-label="Selected group summary"></div>
-          {% if rest_enabled %}<div class="live-coverage" id="live-coverage" role="status" hidden></div>{% endif %}
 
           <nav class="workspace-tabs" aria-label="Audit views">
             <button class="workspace-tab is-active" type="button" data-panel="content-panel">Content</button>
